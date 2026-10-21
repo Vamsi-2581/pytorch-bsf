@@ -1,8 +1,13 @@
+from typing import Any
+
 import numpy as np
+import numpy.typing as npt
 import pytest
 
 pytest.importorskip("sklearn")
 
+from torch_bsf.preprocessing import NormalizeType
+from torch_bsf.simploidal.fitting import Solver
 from torch_bsf.sklearn import BezierSimploidRegressor
 
 
@@ -116,7 +121,7 @@ class TestSetParams:
 
 
 class TestPipelineIntegration:
-    _kwargs = dict(
+    _kwargs: dict[str, Any] = dict(
         degree=2,
         max_epochs=3,
         accelerator="cpu",
@@ -181,7 +186,7 @@ class TestPipelineIntegration:
 
 
 class TestGridSearchCVIntegration:
-    _kwargs = dict(
+    _kwargs: dict[str, Any] = dict(
         max_epochs=3,
         accelerator="cpu",
         devices=1,
@@ -232,14 +237,15 @@ class TestGridSearchCVIntegration:
         assert len(gs.cv_results_["params"]) == 2
 
 
-def _random_simplex(n_samples: int, n_params: int, seed: int) -> np.ndarray:
+def _random_simplex(n_samples: int, n_params: int, seed: int) -> npt.NDArray[Any]:
     """Return float64 points sampled on the standard simplex."""
     rng = np.random.default_rng(seed)
     raw = rng.exponential(size=(n_samples, n_params))
-    return raw / raw.sum(axis=1, keepdims=True)
+    points: npt.NDArray[Any] = raw / raw.sum(axis=1, keepdims=True)
+    return points
 
 
-def _fit_reference(X: np.ndarray, y: np.ndarray, degree: int, ridge: float = 0.0):
+def _fit_reference(X: npt.NDArray[Any], y: npt.NDArray[Any], degree: int, ridge: float = 0.0):
     import torch
 
     from torch_bsf import fit
@@ -475,7 +481,7 @@ class TestLstsqSolver:
             ({"solver": "newton"}, "Unknown solver"),
         ],
     )
-    def test_invalid_option_combinations_raise(self, kwargs: dict, match: str):
+    def test_invalid_option_combinations_raise(self, kwargs: dict[str, Any], match: str):
         """Invalid options raise ValueError in fit."""
         X, y = _make_data()
         reg = BezierSimploidRegressor(degree=2, **kwargs)
@@ -496,8 +502,8 @@ class TestSimploidsAndConstraints:
 
         from torch_bsf.simploidal import sample_simploid
 
-        X = sample_simploid((2, 1), 40, seed=0).double()
-        X = torch.cat([X[:, :3] / X[:, :3].sum(1, keepdim=True), X[:, 3:] / X[:, 3:].sum(1, keepdim=True)], 1).numpy()
+        t = sample_simploid((2, 1), 40, seed=0).double()
+        X = torch.cat([t[:, :3] / t[:, :3].sum(1, keepdim=True), t[:, 3:] / t[:, 3:].sum(1, keepdim=True)], 1).numpy()
         y = np.stack([X[:, 0] * X[:, 3], X[:, 1] ** 2 * X[:, 4]], axis=1)
         reg = BezierSimploidRegressor(degree=(1, 1), simploid_type=(2, 1)).fit(X[:, :], y[:, :1])
         assert reg.simploid_type_ == (2, 1)
@@ -515,7 +521,7 @@ class TestSimploidsAndConstraints:
             reg.predict(X[:, :2])
 
     @pytest.mark.parametrize("solver", ["lstsq", "trainer"])
-    def test_init_freeze_and_smoothness(self, solver: str):
+    def test_init_freeze_and_smoothness(self, solver: Solver):
         """init, freeze and smoothness_weight work with both solvers."""
         from torch_bsf import BezierSimploid
 
@@ -535,7 +541,7 @@ class TestSimploidsAndConstraints:
         assert reg.model_[(2, 0, 0)].tolist() == [0.0, 0.0]
 
     @pytest.mark.parametrize("normalize", ["max", "std"])
-    def test_normalize_predicts_in_original_scale(self, normalize: str):
+    def test_normalize_predicts_in_original_scale(self, normalize: NormalizeType):
         X = _random_simplex(30, 2, seed=0)
         y = 1000.0 * X[:, :1] + 5.0
         reg = BezierSimploidRegressor(degree=1, normalize=normalize).fit(X, y)
