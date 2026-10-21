@@ -4,8 +4,9 @@ import csv
 import json
 import pickle
 from ast import literal_eval
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Iterable, Sequence, cast
+from typing import Any, cast
 
 import torch
 import yaml
@@ -130,7 +131,7 @@ def save(path: str | Path, data: BezierSimploid) -> None:
     path = Path(path)
     suffix = path.suffix.lower()
     control_points = data.control_points.detach().cpu()
-    rows = [(_index_key(index), value.tolist()) for index, value in zip(data.indices(), control_points)]
+    rows = [(_index_key(index), value.tolist()) for index, value in zip(data.indices(), control_points, strict=True)]
     if suffix == ".pt":
         torch.save(
             {"simploid_type": list(data.simploid_type), "degree": list(data.degree), "control_points": control_points.clone()},

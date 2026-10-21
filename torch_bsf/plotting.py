@@ -174,10 +174,7 @@ def _plot_bezier_curve(model, num, ax, show_control_points, **kwargs):
 
     if ax is None:
         fig = plt.figure()
-        if model.n_values >= 3:
-            ax = fig.add_subplot(111, projection="3d")
-        else:
-            ax = fig.add_subplot(111)
+        ax = fig.add_subplot(111, projection="3d" if model.n_values >= 3 else None)
 
     if model.n_values == 2:
         ax.plot(xs[:, 0], xs[:, 1], **kwargs)
@@ -253,10 +250,7 @@ def _plot_bezier_triangle(model, num, ax, show_control_points, **kwargs):
 
     if ax is None:
         fig = plt.figure()
-        if model.n_values >= 3:
-            ax = fig.add_subplot(111, projection="3d")
-        else:
-            ax = fig.add_subplot(111)
+        ax = fig.add_subplot(111, projection="3d" if model.n_values >= 3 else None)
 
     if model.n_values == 2:
         # Use the triangulation connectivity in value space for a consistent 2D plot
@@ -461,7 +455,7 @@ def _cell_grid(simploid_type: tuple[int, ...], cell: _Cell, num: int) -> tuple[t
 
     params = torch.zeros(1, 0)
     coords = np.zeros((1, 0), dtype=int)
-    for a, verts in zip(simploid_type, cell):
+    for a, verts in zip(simploid_type, cell, strict=True):
         g = simplex_grid(len(verts), num) if len(verts) > 1 else torch.ones(1, 1)
         t = torch.zeros(g.shape[0], a + 1)
         t[:, list(verts)] = g
