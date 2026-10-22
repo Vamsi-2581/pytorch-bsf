@@ -62,7 +62,7 @@ EOS
 
 **Prerequisites:** [Docker](https://docs.docker.com/get-docker/).
 
-A pre-built image is available on GHCR, built on `continuumio/miniconda3` with PyTorch installed via the `pytorch` conda channel, providing Intel MKL as the BLAS backend:
+A pre-built image is available on GHCR, built on `condaforge/miniforge3` with PyTorch (CPU build) installed from the `conda-forge` channel:
 
 ```bash
 docker run --rm \
@@ -77,9 +77,9 @@ docker run --rm \
 
 ### 2. via MLflow (No Installation Required)
 
-**Prerequisites:** [Miniconda](https://docs.conda.io/en/latest/miniconda.html) or Anaconda, and `pip install mlflow`.
+**Prerequisites:** [Miniforge](https://conda-forge.org/download/), and `pip install mlflow`. Another conda installation also works, but conda 26.7 and later still add the channels in your `.condarc` to the environment ([conda/conda#16816](https://github.com/conda/conda/issues/16816)), so remove `defaults` there (`conda config --remove channels defaults`) to keep it out.
 
-MLflow creates a conda environment from the project's `environment.yml`, which uses the `pytorch` conda channel and Intel MKL:
+MLflow creates a conda environment from the project's `environment.yml`, which installs PyTorch and the other dependencies from the `conda-forge` channel only:
 
 ```bash
 mlflow run https://github.com/opthub-org/pytorch-bsf \
