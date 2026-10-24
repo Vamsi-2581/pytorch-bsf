@@ -22,6 +22,21 @@ def scipy_sparse() -> Any:
     return sparse
 
 
+def _scaled_difference(left: torch.Tensor, right: torch.Tensor, scale: float | torch.Tensor) -> torch.Tensor:
+    """Preserve finite differences, falling back only when subtraction overflows."""
+    difference = left - right
+    result = difference * scale
+    overflow = ~torch.isfinite(difference)
+    if overflow.any():
+        factors = torch.as_tensor(scale, dtype=left.dtype, device=left.device).expand_as(difference)
+        result[overflow] = left[overflow] * factors[overflow] - right[overflow] * factors[overflow]
+    return result
+
+
+def _scaled_differences(coefficients: torch.Tensor, edges: torch.Tensor, scale: float) -> torch.Tensor:
+    return _scaled_difference(coefficients[edges[:, 0]], coefficients[edges[:, 1]], scale)
+
+
 class LeastSquaresProblem:
     """Linear operator for normalized observations and the exact penalty rows."""
 
@@ -29,7 +44,8 @@ class LeastSquaresProblem:
         self.space, self.samples, self.penalty = space, samples, penalty
         self.basis = space.basis(Points(samples.points.parameters.detach(), samples.points.cell_ids).to())
         self.values = samples.values.detach().cpu().double()
-        self.scale = (samples.weights.detach() / samples.weights.detach().sum()).sqrt()
+        weights = samples.weights.detach()
+        self.scale = weights.sqrt() / weights.sum().sqrt()
         self.fixed = torch.zeros(space.n_controls, self.values.shape[1], dtype=torch.float64)
         self.free = torch.ones(space.n_controls, dtype=torch.bool)
         for row, value in (fixed.values if fixed is not None else {}).items():
@@ -63,14 +79,20 @@ class LeastSquaresProblem:
         self.reg_values = torch.cat(values).double() if values else torch.empty(0, dtype=torch.float64)
         self.n_regularizers = offset
         self.shape = (len(samples) + offset, self.n_free)
-        target = torch.cat([self.values * self.scale[:, None], torch.zeros(offset, self.values.shape[1], dtype=torch.float64)])
-        self.rhs = target - self.full_matmat(self.fixed)
+        data_rhs = _scaled_difference(self.values, self.basis.matmat(self.fixed), self.scale[:, None])
+        self.rhs = torch.cat([data_rhs, -self._penalty_matmat(self.fixed)])
 
     def full_matmat(self, coefficients: torch.Tensor) -> torch.Tensor:
         data = self.basis.matmat(coefficients) * self.scale[:, None]
-        reg = coefficients.new_zeros(self.n_regularizers, coefficients.shape[1])
-        reg = reg.index_add(0, self.reg_rows, self.reg_values[:, None] * coefficients[self.reg_columns])
-        return torch.cat([data, reg])
+        return torch.cat([data, self._penalty_matmat(coefficients)])
+
+    def _penalty_matmat(self, coefficients: torch.Tensor) -> torch.Tensor:
+        blocks = []
+        if self.penalty.smoothness:
+            blocks.append(_scaled_differences(coefficients, self.edges, self.penalty.smoothness**0.5))
+        if self.penalty.ridge:
+            blocks.append(coefficients * self.penalty.ridge**0.5)
+        return torch.cat(blocks) if blocks else coefficients.new_zeros(0, coefficients.shape[1])
 
     def matmat(self, free_coefficients: torch.Tensor) -> torch.Tensor:
         full = free_coefficients.new_zeros(self.space.n_controls, free_coefficients.shape[1])
@@ -106,12 +128,14 @@ class LeastSquaresProblem:
         return full
 
     def metrics(self, coefficients: torch.Tensor) -> dict[str, float]:
-        residual = self.basis.matmat(coefficients) - self.values
-        data_loss = (residual.square() * self.scale[:, None].square()).sum().item()
-        ridge = self.penalty.ridge * coefficients.square().sum().item()
-        smoothness = (
-            self.penalty.smoothness * (coefficients[self.edges[:, 0]] - coefficients[self.edges[:, 1]]).square().sum().item()
-        )
+        active = self.scale > 0
+        scale = self.scale[active, None]
+        residual = _scaled_difference(self.basis.matmat(coefficients)[active], self.values[active], scale)
+        data_loss = residual.square().sum().item()
+        ridge = (coefficients * self.penalty.ridge**0.5).square().sum().item() if self.penalty.ridge else 0.0
+        smoothness = 0.0
+        if self.penalty.smoothness:
+            smoothness = _scaled_differences(coefficients, self.edges, self.penalty.smoothness**0.5).square().sum().item()
         return {
             "data_mse": data_loss / self.values.shape[1],
             "data_loss": data_loss,

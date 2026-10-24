@@ -154,11 +154,13 @@ def test_explicit_failure_guards():
     with pytest.raises(TypeError):
         fit(space, observations, solver="dense")  # type: ignore[arg-type]
     with patch("torch.linalg.lstsq") as solve:
-        solve.return_value.solution = torch.full((2, 1), float("nan"))
-        solve.return_value.singular_values = torch.ones(2)
+        solve.return_value.solution = torch.full((2, 1), float("nan"), dtype=torch.float64)
+        solve.return_value.singular_values = torch.ones(2, dtype=torch.float64)
         solve.return_value.rank = torch.tensor(2)
-        with pytest.raises(ArithmeticError):
-            fit(space, observations)
+        with pytest.warns(ConvergenceWarning):
+            result = fit(space, observations)
+        assert not result.success and result.status == "numerical_failure"
+        assert not result.diagnostics.solution_available
 
 
 def test_minimization_stopping_and_validation():
