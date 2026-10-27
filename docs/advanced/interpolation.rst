@@ -90,7 +90,9 @@ keep the vectorized float64 path. The fallback is slower and caches one
 exact inverse per affected simplex; its integer sizes depend on the input
 exponents. For differentiable inputs the fallback uses the exact affine
 Jacobian for point and vertex gradients, including when the floating-point
-solve overflows. ``locate(batch_size=...)`` bounds temporary float64 storage by
+solve overflows. Finite upstream gradients are contracted exactly before
+rounding, so overflowing terms that cancel cannot spoil a finite derivative.
+``locate(batch_size=...)`` bounds temporary float64 storage by
 ``O(batch_size * n_simplices * (d + 1))``, in addition to that cache.
 
 This corrects loss of precision in the solve, rather than changing the

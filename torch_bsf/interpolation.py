@@ -250,6 +250,37 @@ def _rounded_fraction(value: Fraction) -> float:
         return math.inf if value > 0 else -math.inf
 
 
+def _rational_pullback(
+    gradient: torch.Tensor,
+    points: torch.Tensor,
+    origin: list[Fraction],
+    inverse: list[list[Fraction]],
+    vertices_required: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Round only after contracting the exact affine Jacobian, including cancellation across output rows."""
+    d = len(origin)
+    vertex = [[Fraction(0) for _ in range(d)] for _ in range(d + 1)]
+    result = []
+    for row, point in zip(gradient.tolist(), points.tolist(), strict=True):
+        differences = [Fraction(g) - Fraction(row[0]) for g in row[1:]]
+        pullback = [sum((g * b[j] for g, b in zip(differences, inverse, strict=True)), Fraction(0)) for j in range(d)]
+        result.append([_rounded_fraction(v) for v in pullback])
+        if vertices_required:
+            offset = [Fraction(v) - o for v, o in zip(point, origin, strict=True)]
+            rest = [sum((a * b for a, b in zip(edge, offset, strict=True)), Fraction(0)) for edge in inverse]
+            weights = [1 - sum(rest, Fraction(0)), *rest]
+            for i, weight in enumerate(weights):
+                for j, value in enumerate(pullback):
+                    vertex[i][j] -= weight * value
+    point_gradient = torch.tensor(result, dtype=torch.float64)
+    vertex_gradient = (
+        torch.tensor([[_rounded_fraction(v) for v in row] for row in vertex], dtype=torch.float64)
+        if vertices_required
+        else None
+    )
+    return point_gradient, vertex_gradient
+
+
 class _ExactBarycentric(torch.autograd.Function):
     """Use the exact affine Jacobian instead of differentiating an overflowed floating solve."""
 
@@ -261,14 +292,17 @@ class _ExactBarycentric(torch.autograd.Function):
         values: torch.Tensor,
         mantissa: torch.Tensor,
         exponent: torch.Tensor,
+        origin: list[Fraction],
+        inverse: list[list[Fraction]],
     ) -> torch.Tensor:
         result = values.clone()
-        ctx.save_for_backward(result, mantissa, exponent)
+        ctx.save_for_backward(result, mantissa, exponent, points)
+        ctx.origin, ctx.inverse = origin, inverse
         return result
 
     @staticmethod
-    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None, None, None]:
-        values, mantissa, exponent = ctx.saved_tensors
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None, None, None, None, None, None]:
+        values, mantissa, exponent, points = ctx.saved_tensors
         # Scale after applying the upstream gradient: an unrepresentable Jacobian entry can still
         # contribute a finite gradient, and a zero upstream gradient must not multiply infinity.
         upstream, upstream_power = _Frexp.apply(gradient)
@@ -283,7 +317,18 @@ class _ExactBarycentric(torch.autograd.Function):
             weights[:, :, None, None] * upstream[:, None, :, None] * mantissa[None, None],
             weight_power[:, :, None, None] + upstream_power[:, None, :, None] + exponent[None, None],
         ).sum(dim=(0, 2))
-        return point_gradient, vertex_gradient, None, None, None
+        if torch.isfinite(gradient).all():
+            # Individual terms can overflow and cancel to a finite derivative even after scaling.
+            # Compute the final contraction exactly, retaining the tensor path for higher derivatives.
+            exact_point, exact_vertex = _rational_pullback(gradient, points, ctx.origin, ctx.inverse, ctx.needs_input_grad[1])
+            finite = torch.where(torch.isfinite(point_gradient), point_gradient, 0.0)
+            point_gradient = exact_point + (finite - finite.detach())
+            if exact_vertex is not None:
+                finite = torch.where(torch.isfinite(vertex_gradient), vertex_gradient, 0.0)
+                vertex_gradient = exact_vertex + (finite - finite.detach())
+            else:
+                return point_gradient, None, None, None, None, None, None
+        return point_gradient, vertex_gradient, None, None, None, None, None
 
 
 def _length_key(a: torch.Tensor, b: torch.Tensor) -> tuple[int, float]:
@@ -619,7 +664,7 @@ class SimplicialMesh:
                     approximate = torch.cat([origin_row, other])
                     finite = torch.where(torch.isfinite(approximate), approximate, 0.0)
                     mantissa = mantissa + (finite - finite.detach())
-                values = _ExactBarycentric.apply(p[indices], vertices, values, mantissa, exponent)
+                values = _ExactBarycentric.apply(p[indices], vertices, values, mantissa, exponent, origin, inverse)
             result[indices, cell] = values
         return result
 

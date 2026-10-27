@@ -475,6 +475,24 @@ def test_exact_backward_ignores_unused_rows_with_unrepresentable_derivatives():
     torch.testing.assert_close(vertex_gradient, expected, rtol=0, atol=0)
 
 
+def test_exact_backward_cancels_large_output_weights_before_rounding():
+    vertices = torch.tensor([[0.0, 0.0], [1.0, 1.0], [2.0**-100, -(2.0**-100)]], dtype=torch.float64, requires_grad=True)
+    point = torch.tensor([[0.25, 0.25]], dtype=torch.float64, requires_grad=True)
+    lam = SimplicialMesh(vertices, [[0, 1, 2]]).barycentric(point)
+    # A constant function has zero derivatives even when its individual pullback terms overflow.
+    point_gradient, vertex_gradient = torch.autograd.grad(lam.sum() * 2.0**1000, (point, vertices))
+    assert torch.equal(point_gradient, torch.zeros_like(point))
+    assert torch.equal(vertex_gradient, torch.zeros_like(vertices))
+
+
+def test_exact_backward_propagates_nonfinite_upstream_gradients():
+    mesh = SimplicialMesh([[0.0, 0.0], [1.0, 1.0], [2.0**-100, -(2.0**-100)]], [[0, 1, 2]])
+    point = torch.tensor([[0.25, 0.25]], dtype=torch.float64, requires_grad=True)
+    lam = mesh.barycentric(point)
+    (gradient,) = torch.autograd.grad(lam, point, grad_outputs=torch.full_like(lam, torch.nan))
+    assert torch.isnan(gradient).all()
+
+
 def test_locate_tolerance_and_outside_points():
     mesh = SimplicialMesh([[0.0], [1.0], [2.0]], [[0, 1], [1, 2]])
     found = mesh.locate(torch.tensor([[-1e-10], [2.0 + 1e-10]]))
