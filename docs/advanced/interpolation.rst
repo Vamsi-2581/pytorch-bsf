@@ -88,10 +88,15 @@ affected point/simplex pairs with exact rational arithmetic on the input
 floats, rounding the resulting coordinates once to float64. Ordinary pairs
 keep the vectorized float64 path. The fallback is slower and caches one
 exact inverse per affected simplex; its integer sizes depend on the input
-exponents. For differentiable inputs the fallback uses the exact affine
-Jacobian for point and vertex gradients, including when the floating-point
-solve overflows. Finite upstream gradients are contracted exactly before
-rounding, so overflowing terms that cancel cannot spoil a finite derivative.
+exponents. For differentiable inputs the fallback uses cached SymPy
+expressions to differentiate the exact affine map, including the dependence
+on vertices. Each derivative order is evaluated with exact rational inputs
+before rounding, so overflowing terms that cancel cannot spoil finite
+derivatives. Points are handled independently, including when another point
+has a non-finite upstream gradient. SymPy is declared directly (PyTorch also
+requires it) and is imported lazily for these queries. Symbolic work and
+retained autograd state grow with dimension and derivative order, so this
+path is slower than ordinary tensor differentiation.
 ``locate(batch_size=...)`` bounds temporary float64 storage by
 ``O(batch_size * n_simplices * (d + 1))``, in addition to that cache.
 

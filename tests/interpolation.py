@@ -493,6 +493,41 @@ def test_exact_backward_propagates_nonfinite_upstream_gradients():
     assert torch.isnan(gradient).all()
 
 
+@pytest.mark.parametrize("bad", [torch.nan, torch.inf, -torch.inf])
+def test_exact_backward_isolates_nonfinite_rows_in_a_batch(bad):
+    large, small = 2.0**1000, 2.0**-463
+    mesh = SimplicialMesh([[0.0, 0.0], [large, small], [large, small + 2.0**-500]], [[0, 1, 2]])
+    points = torch.tensor([[large, small], [large, small]], dtype=torch.float64, requires_grad=True)
+    lam = mesh.barycentric(points)
+    upstream = torch.tensor([[[bad, bad, bad]], [[0.0, large, large]]], dtype=torch.float64)
+    (gradient,) = torch.autograd.grad(lam, points, grad_outputs=upstream)
+    torch.testing.assert_close(gradient[1], torch.tensor([1.0, 0.0], dtype=torch.float64), rtol=0, atol=0)
+
+
+def test_exact_backward_preserves_higher_derivatives_through_cancellation():
+    large, small, gap = 2.0**1000, 2.0**-463, 2.0**-500
+    vertices = torch.tensor([[0.0, 0.0], [large, small], [large, small + gap]], dtype=torch.float64, requires_grad=True)
+    point = vertices.detach()[1:2].clone().requires_grad_(True)
+    lam = SimplicialMesh(vertices, [[0, 1, 2]]).barycentric(point)
+    (first,) = torch.autograd.grad(large * lam[:, :, 1:].sum(), point, create_graph=True)
+    torch.testing.assert_close(first, torch.tensor([[1.0, 0.0]], dtype=torch.float64), rtol=0, atol=0)
+    (second,) = torch.autograd.grad(first[0, 1], vertices, create_graph=True)
+    assert second[1, 0].item() == 2.0**500
+    (third,) = torch.autograd.grad(second[1, 0], vertices)
+    assert third[1, 0].item() == -2 * (small + gap)
+
+
+def test_exact_backward_supports_vertex_gradients_with_a_constant_point():
+    short = 2.0**-100
+    vertices = torch.tensor([[0.0, 0.0], [1.0, 1.0], [short, -short]], dtype=torch.float64, requires_grad=True)
+    point = torch.tensor([[0.25, 0.25]], dtype=torch.float64)
+    lam = SimplicialMesh(vertices, [[0, 1, 2]]).barycentric(point)
+    (gradient,) = torch.autograd.grad(lam[:, :, 2].sum(), vertices)
+    weights = torch.tensor([[0.75], [0.25], [0.0]], dtype=torch.float64)
+    jacobian = torch.tensor([[1 / (2 * short), -1 / (2 * short)]], dtype=torch.float64)
+    torch.testing.assert_close(gradient, -weights * jacobian, rtol=0, atol=0)
+
+
 def test_locate_tolerance_and_outside_points():
     mesh = SimplicialMesh([[0.0], [1.0], [2.0]], [[0, 1], [1, 2]])
     found = mesh.locate(torch.tensor([[-1e-10], [2.0 + 1e-10]]))

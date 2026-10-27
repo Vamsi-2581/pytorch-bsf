@@ -250,85 +250,78 @@ def _rounded_fraction(value: Fraction) -> float:
         return math.inf if value > 0 else -math.inf
 
 
-def _rational_pullback(
-    gradient: torch.Tensor,
-    points: torch.Tensor,
-    origin: list[Fraction],
-    inverse: list[list[Fraction]],
-    vertices_required: bool,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Round only after contracting the exact affine Jacobian, including cancellation across output rows."""
-    d = len(origin)
-    vertex = [[Fraction(0) for _ in range(d)] for _ in range(d + 1)]
-    result = []
-    for row, point in zip(gradient.tolist(), points.tolist(), strict=True):
-        differences = [Fraction(g) - Fraction(row[0]) for g in row[1:]]
-        pullback = [sum((g * b[j] for g, b in zip(differences, inverse, strict=True)), Fraction(0)) for j in range(d)]
-        result.append([_rounded_fraction(v) for v in pullback])
-        if vertices_required:
-            offset = [Fraction(v) - o for v, o in zip(point, origin, strict=True)]
-            rest = [sum((a * b for a, b in zip(edge, offset, strict=True)), Fraction(0)) for edge in inverse]
-            weights = [1 - sum(rest, Fraction(0)), *rest]
-            for i, weight in enumerate(weights):
-                for j, value in enumerate(pullback):
-                    vertex[i][j] -= weight * value
-    point_gradient = torch.tensor(result, dtype=torch.float64)
-    vertex_gradient = (
-        torch.tensor([[_rounded_fraction(v) for v in row] for row in vertex], dtype=torch.float64)
-        if vertices_required
-        else None
-    )
-    return point_gradient, vertex_gradient
+class _ExactExpressions(torch.autograd.Function):
+    """Evaluate and differentiate rational expressions before rounding, at every derivative order.
 
-
-class _ExactBarycentric(torch.autograd.Function):
-    """Use the exact affine Jacobian instead of differentiating an overflowed floating solve."""
+    Each invocation describes one point, so non-finite cotangents of another point cannot contaminate it.
+    SymPy is loaded only for differentiable queries that require the exact fallback.
+    """
 
     @staticmethod
     def forward(
         ctx: Any,
-        points: torch.Tensor,
-        vertices: torch.Tensor,
-        values: torch.Tensor,
-        mantissa: torch.Tensor,
-        exponent: torch.Tensor,
-        origin: list[Fraction],
-        inverse: list[list[Fraction]],
+        expressions: tuple[Any, ...],
+        symbols: tuple[tuple[Any, ...], ...],
+        shape: tuple[int, ...],
+        *arguments: torch.Tensor,
     ) -> torch.Tensor:
-        result = values.clone()
-        ctx.save_for_backward(result, mantissa, exponent, points)
-        ctx.origin, ctx.inverse = origin, inverse
-        return result
+        import sympy as sp
+
+        bindings = {}
+        for group, argument in zip(symbols, arguments, strict=True):
+            for symbol, value in zip(group, argument.reshape(-1).tolist(), strict=True):
+                if math.isfinite(value):
+                    bindings[symbol] = sp.Rational(value)
+                elif math.isnan(value):
+                    bindings[symbol] = sp.nan
+                else:
+                    bindings[symbol] = sp.oo if value > 0 else -sp.oo
+        numbers = [expression.xreplace(bindings) for expression in expressions]
+        values = [_rounded_fraction(Fraction(int(v.p), int(v.q))) if v.is_Rational else float(v) for v in numbers]
+        ctx.expressions, ctx.symbols = expressions, symbols
+        ctx.save_for_backward(*arguments)
+        return torch.tensor(values, dtype=torch.float64).reshape(shape)
 
     @staticmethod
-    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None, None, None, None, None, None]:
-        values, mantissa, exponent, points = ctx.saved_tensors
-        # Scale after applying the upstream gradient: an unrepresentable Jacobian entry can still
-        # contribute a finite gradient, and a zero upstream gradient must not multiply infinity.
-        upstream, upstream_power = _Frexp.apply(gradient)
-        point_gradient = _times_power_of_two(
-            upstream[:, :, None] * mantissa[None], upstream_power[:, :, None] + exponent[None]
-        ).sum(dim=1)
-        # d lambda_i / d vertex_j = -lambda_j * d lambda_i / d point.
-        # Apply the weights before rounding: a tiny point gradient can underflow even when its
-        # product with a large barycentric weight is a finite, nonzero vertex gradient.
-        weights, weight_power = _Frexp.apply(values)
-        vertex_gradient = -_times_power_of_two(
-            weights[:, :, None, None] * upstream[:, None, :, None] * mantissa[None, None],
-            weight_power[:, :, None, None] + upstream_power[:, None, :, None] + exponent[None, None],
-        ).sum(dim=(0, 2))
-        if torch.isfinite(gradient).all():
-            # Individual terms can overflow and cancel to a finite derivative even after scaling.
-            # Compute the final contraction exactly, retaining the tensor path for higher derivatives.
-            exact_point, exact_vertex = _rational_pullback(gradient, points, ctx.origin, ctx.inverse, ctx.needs_input_grad[1])
-            finite = torch.where(torch.isfinite(point_gradient), point_gradient, 0.0)
-            point_gradient = exact_point + (finite - finite.detach())
-            if exact_vertex is not None:
-                finite = torch.where(torch.isfinite(vertex_gradient), vertex_gradient, 0.0)
-                vertex_gradient = exact_vertex + (finite - finite.detach())
-            else:
-                return point_gradient, None, None, None, None, None, None
-        return point_gradient, vertex_gradient, None, None, None, None, None
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[Any, ...]:
+        import sympy as sp
+
+        arguments = ctx.saved_tensors
+        cotangents = tuple(sp.Dummy(real=True) for _ in ctx.expressions)
+        symbols = (*ctx.symbols, cotangents)
+        result: list[torch.Tensor | None] = []
+        for index, argument in enumerate(arguments):
+            if not ctx.needs_input_grad[index + 3]:
+                result.append(None)
+                continue
+            derivatives = tuple(
+                sp.Add(*(g * sp.diff(expression, variable) for g, expression in zip(cotangents, ctx.expressions, strict=True)))
+                for variable in ctx.symbols[index]
+            )
+            result.append(_ExactExpressions.apply(derivatives, symbols, tuple(argument.shape), *arguments, gradient))
+        return None, None, None, *result
+
+
+def _barycentric_expressions(
+    dimension: int, origin: list[Fraction], inverse: list[list[Fraction]], vertex_gradients: bool
+) -> tuple[tuple[Any, ...], tuple[tuple[Any, ...], ...]]:
+    """Compile a cell's exact affine formula; symbolic vertex coordinates retain inverse derivatives."""
+    import sympy as sp
+
+    point = tuple(sp.Dummy(real=True) for _ in range(dimension))
+    symbols: tuple[tuple[Any, ...], ...]
+    if vertex_gradients:
+        vertices = tuple(sp.Dummy(real=True) for _ in range((dimension + 1) * dimension))
+        edges = sp.Matrix(dimension, dimension, lambda i, j: vertices[(j + 1) * dimension + i] - vertices[i])
+        offset = sp.Matrix([p - v for p, v in zip(point, vertices[:dimension], strict=True)])
+        rest = edges.inv() * offset
+        symbols = (point, vertices)
+    else:
+        matrix = sp.Matrix([[sp.Rational(v.numerator, v.denominator) for v in row] for row in inverse])
+        offset = sp.Matrix([p - sp.Rational(v.numerator, v.denominator) for p, v in zip(point, origin, strict=True)])
+        rest = matrix * offset
+        symbols = (point,)
+    return (1 - sum(rest), *rest), symbols
 
 
 def _length_key(a: torch.Tensor, b: torch.Tensor) -> tuple[int, float]:
@@ -431,6 +424,7 @@ class SimplicialMesh:
             condition, amplification
         ) > 1e-12
         self._exact_inverses: dict[int, tuple[list[Fraction], list[list[Fraction]]]] = {}
+        self._exact_formulas: dict[tuple[int, bool], tuple[tuple[Any, ...], tuple[tuple[Any, ...], ...]]] = {}
         # Volumes are kept as mantissa * 2**exponent too, so that a product with a volume beyond the float64 range
         # (e.g. a refinement score) can still be finite.
         self._volume_mantissa = det.abs() / factorial(d)
@@ -596,6 +590,9 @@ class SimplicialMesh:
         are evaluated with exact rational arithmetic on the input floats and rounded once to float64.
         This slower path caches one exact inverse per affected simplex. It recovers coordinates lost by
         the solve, but cannot recover information already lost when the input points were rounded.
+        Differentiable affected pairs additionally use cached SymPy expressions. Their derivatives are
+        evaluated exactly at every order before rounding, independently for each point. Symbolic work and
+        retained autograd state grow with dimension and derivative order; this path is intentionally slower.
         """
         p = self._check_points(x)
         origin = self.vertices[self.simplices[:, 0]]  # (m, d)
@@ -630,41 +627,25 @@ class SimplicialMesh:
                 self._exact_inverses[cell] = _rational_inverse(vertices)
             origin, inverse = self._exact_inverses[cell]
             indices = uncertain[:, cell].nonzero().flatten()
-            rows = []
-            for point in p[indices].tolist():
-                exact_offset = [Fraction(v) - o for v, o in zip(point, origin, strict=True)]
-                exact_rest = [sum((a * b for a, b in zip(row, exact_offset, strict=True)), Fraction(0)) for row in inverse]
-                rows.append([_rounded_fraction(v) for v in [1 - sum(exact_rest, Fraction(0)), *exact_rest]])
-            values = torch.tensor(rows, dtype=torch.float64)
             if coordinates.requires_grad:
-                first = [-sum(column, Fraction(0)) for column in zip(*inverse, strict=True)]
-                jacobian = [first, *inverse]
-                powers = [[v.numerator.bit_length() - v.denominator.bit_length() for v in row] for row in jacobian]
-                # A zero first-row entry is a cancellation of the other rows: use their scale so its
-                # differentiable representation does not overflow before summing those rows.
-                for j, value in enumerate(first):
-                    if value == 0:
-                        powers[0][j] = max(row[j] for row in powers[1:])
-                exponent = torch.tensor(powers, dtype=torch.long)
-                mantissa = torch.tensor(
-                    [
-                        [float(v / Fraction(2) ** e) for v, e in zip(row, power, strict=True)]
-                        for row, power in zip(jacobian, powers, strict=True)
-                    ],
-                    dtype=torch.float64,
-                )
-                if vertices.requires_grad:
-                    # Retain the inverse's vertex dependence for higher derivatives while correcting
-                    # its value to the exact Jacobian. Point derivatives use no overflowed dot products.
-                    physical_power = -self._edge_exponent[cell, :, None] - self._axis_exponent[cell, None, :]
-                    other = _times_power_of_two(self._inverse[cell], physical_power - exponent[1:])
-                    origin_row = -_times_power_of_two(self._inverse[cell], physical_power - exponent[0, None]).sum(
-                        dim=0, keepdim=True
+                key = (cell, vertices.requires_grad)
+                if key not in self._exact_formulas:
+                    self._exact_formulas[key] = _barycentric_expressions(
+                        self.dimension, origin, inverse, vertices.requires_grad
                     )
-                    approximate = torch.cat([origin_row, other])
-                    finite = torch.where(torch.isfinite(approximate), approximate, 0.0)
-                    mantissa = mantissa + (finite - finite.detach())
-                values = _ExactBarycentric.apply(p[indices], vertices, values, mantissa, exponent, origin, inverse)
+                expressions, symbols = self._exact_formulas[key]
+                rows = []
+                for index in indices.tolist():
+                    arguments = (p[index], vertices) if vertices.requires_grad else (p[index],)
+                    rows.append(_ExactExpressions.apply(expressions, symbols, (self.dimension + 1,), *arguments))
+                values = torch.stack(rows)
+            else:
+                exact_rows = []
+                for point in p[indices].tolist():
+                    exact_offset = [Fraction(v) - o for v, o in zip(point, origin, strict=True)]
+                    exact_rest = [sum((a * b for a, b in zip(row, exact_offset, strict=True)), Fraction(0)) for row in inverse]
+                    exact_rows.append([_rounded_fraction(v) for v in [1 - sum(exact_rest, Fraction(0)), *exact_rest]])
+                values = torch.tensor(exact_rows, dtype=torch.float64)
             result[indices, cell] = values
         return result
 
@@ -687,6 +668,7 @@ class SimplicialMesh:
             ``O(batch_size * n_simplices * (d + 1))``. Exact arithmetic for cancellation-prone pairs additionally
             caches ``O(d**2)`` rational coefficients per affected simplex, whose integer sizes depend on the
             input exponents. Those pairs are processed sequentially without an array of rational coordinates.
+            Differentiable queries additionally retain symbolic expression caches and autograd state.
 
         Returns
         -------
