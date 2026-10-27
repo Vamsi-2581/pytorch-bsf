@@ -279,6 +279,34 @@ def test_locate_boundary_points(dim, n):
     mesh.space.validate(found)
 
 
+@pytest.mark.parametrize("exponent", [-100, -60, -30, 0, 30, 60, 100])
+def test_locate_vertices_and_edge_midpoints_on_extreme_aspect_ratio(exponent):
+    """Vertices and edge midpoints remain locatable for edge-length ratios through 2**±100."""
+    short = 2.0**(-exponent)
+    vertices = torch.tensor([[0.0, 0.0], [1.0, 0.3], [0.7 * short, -0.2 * short]], dtype=torch.float64)
+    mesh = SimplicialMesh(vertices, [[0, 1, 2]])
+
+    pairs = torch.tensor(list(itertools.combinations(range(3), 2)))
+    midpoints = vertices[pairs].mean(dim=1)
+    points = torch.cat([vertices, midpoints])
+    expected = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.5, 0.5, 0.0],
+            [0.5, 0.0, 0.5],
+            [0.0, 0.5, 0.5],
+        ],
+        dtype=torch.float64,
+    )
+
+    found = mesh.locate(points)
+    torch.testing.assert_close(found.parameters, expected, atol=1e-12, rtol=0)
+
+
+
+
 def test_locate_tolerance_and_outside_points():
     mesh = SimplicialMesh([[0.0], [1.0], [2.0]], [[0, 1], [1, 2]])
     found = mesh.locate(torch.tensor([[-1e-10], [2.0 + 1e-10]]))
