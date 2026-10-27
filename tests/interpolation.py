@@ -415,6 +415,30 @@ def test_exact_inverse_rejects_an_affinely_dependent_simplex():
         _rational_inverse(vertices)
 
 
+def test_exact_fallback_preserves_gradients_after_floating_products_overflow():
+    """Codex review: finite exact coordinates/Jacobians must not inherit the overflowed solve's zero gradient."""
+    length = 2.0**-980
+    mesh = SimplicialMesh([[0.0, 0.0], [length, length], [length, length * (1 + 2.0**-37)]], [[0, 1, 2]])
+    point = torch.tensor([[2.0**8, 2.0**8]], dtype=torch.float64, requires_grad=True)
+    lam = mesh.barycentric(point)
+    torch.testing.assert_close(lam[0, 0], torch.tensor([1 - 2.0**988, 2.0**988, 0.0], dtype=torch.float64), rtol=0, atol=0)
+    gradient = torch.autograd.grad(lam[:, :, 2].sum(), point)[0]
+    torch.testing.assert_close(gradient, torch.tensor([[-(2.0**1017), 2.0**1017]], dtype=torch.float64), rtol=0, atol=0)
+
+
+def test_exact_fallback_preserves_vertex_and_second_derivatives():
+    short = 2.0**-20
+    vertices = torch.tensor([[0.0, 0.0], [1.0, 1.0], [short, -short]], dtype=torch.float64, requires_grad=True)
+    point = torch.tensor([[0.25, 0.25]], dtype=torch.float64, requires_grad=True)
+    lam = SimplicialMesh(vertices, [[0, 1, 2]]).barycentric(point)
+    point_gradient, vertex_gradient = torch.autograd.grad(lam[:, :, 2].sum(), (point, vertices), create_graph=True)
+    jacobian = torch.tensor([[1 / (2 * short), -1 / (2 * short)]], dtype=torch.float64)
+    torch.testing.assert_close(point_gradient, jacobian, rtol=0, atol=0)
+    torch.testing.assert_close(vertex_gradient, -lam.detach()[0, 0, :, None] * jacobian, rtol=0, atol=0)
+    second = torch.autograd.grad(point_gradient[0, 0], vertices)[0]
+    assert second[2, 0].item() == -((1 / (2 * short)) ** 2)
+
+
 def test_locate_tolerance_and_outside_points():
     mesh = SimplicialMesh([[0.0], [1.0], [2.0]], [[0, 1], [1, 2]])
     found = mesh.locate(torch.tensor([[-1e-10], [2.0 + 1e-10]]))

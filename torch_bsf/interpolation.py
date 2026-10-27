@@ -235,6 +235,26 @@ def _rounded_fraction(value: Fraction) -> float:
         return math.inf if value > 0 else -math.inf
 
 
+class _ExactBarycentric(torch.autograd.Function):
+    """Use the exact affine Jacobian instead of differentiating an overflowed floating solve."""
+
+    @staticmethod
+    def forward(
+        ctx: Any, points: torch.Tensor, vertices: torch.Tensor, values: torch.Tensor, jacobian: torch.Tensor
+    ) -> torch.Tensor:
+        result = values.clone()
+        ctx.save_for_backward(result, jacobian)
+        return result
+
+    @staticmethod
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None, None]:
+        values, jacobian = ctx.saved_tensors
+        point_gradient = gradient @ jacobian
+        # d lambda_i / d vertex_j = -lambda_j * d lambda_i / d point.
+        vertex_gradient = -values.T @ point_gradient
+        return point_gradient, vertex_gradient, None, None
+
+
 def _length_key(a: torch.Tensor, b: torch.Tensor) -> tuple[int, float]:
     """A key ordering segments ``ab`` by Euclidean length, without overflow or underflow.
 
@@ -505,27 +525,47 @@ class SimplicialMesh:
         uncertain = (error > 1e-12 * (1 + coordinates.abs())).any(dim=2) | ~torch.isfinite(coordinates).all(dim=2)
         if not uncertain.any():
             return coordinates
-        return self._exact_barycentric(p, coordinates, uncertain)
+        return self._exact_barycentric(p, coordinates, uncertain, offset)
 
-    def _exact_barycentric(self, p: torch.Tensor, coordinates: torch.Tensor, uncertain: torch.Tensor) -> torch.Tensor:
+    def _exact_barycentric(
+        self, p: torch.Tensor, coordinates: torch.Tensor, uncertain: torch.Tensor, offset: torch.Tensor
+    ) -> torch.Tensor:
         """Correct cancellation-prone pairs, retaining the derivative of the same affine map."""
         result = coordinates.detach().clone()
+        if coordinates.requires_grad:
+            # Rebuild the ordinary derivative path with finite offsets: even a zero upstream gradient
+            # through an overflowed dot product can otherwise contaminate vertex gradients with NaN.
+            safe_offset = torch.where(uncertain[:, :, None], 0.0, offset)
+            rest = _times_power_of_two(torch.einsum("mij,nmj->nmi", self._inverse, safe_offset), -self._edge_exponent[None])
+            result = torch.cat([1 - rest.sum(dim=2, keepdim=True), rest], dim=2)
         for cell in uncertain.any(dim=0).nonzero().flatten().tolist():
+            vertices = self.vertices[self.simplices[cell]]
             if cell not in self._exact_inverses:
-                self._exact_inverses[cell] = _rational_inverse(self.vertices[self.simplices[cell]])
+                self._exact_inverses[cell] = _rational_inverse(vertices)
             origin, inverse = self._exact_inverses[cell]
             indices = uncertain[:, cell].nonzero().flatten()
             rows = []
             for point in p[indices].tolist():
-                offset = [Fraction(v) - o for v, o in zip(point, origin, strict=True)]
-                rest = [sum((a * b for a, b in zip(row, offset, strict=True)), Fraction(0)) for row in inverse]
-                rows.append([_rounded_fraction(v) for v in [1 - sum(rest, Fraction(0)), *rest]])
-            result[indices, cell] = torch.tensor(rows, dtype=torch.float64)
-        if coordinates.requires_grad:
-            # Both paths evaluate the same affine map. Keep its existing differentiable tensor path;
-            # adding a detached numerical correction must not erase point or vertex gradients.
-            finite = torch.where(torch.isfinite(coordinates), coordinates, 0.0)
-            result = result + (finite - finite.detach())
+                exact_offset = [Fraction(v) - o for v, o in zip(point, origin, strict=True)]
+                exact_rest = [sum((a * b for a, b in zip(row, exact_offset, strict=True)), Fraction(0)) for row in inverse]
+                rows.append([_rounded_fraction(v) for v in [1 - sum(exact_rest, Fraction(0)), *exact_rest]])
+            values = torch.tensor(rows, dtype=torch.float64)
+            if coordinates.requires_grad:
+                first = [-sum(column, Fraction(0)) for column in zip(*inverse, strict=True)]
+                jacobian = torch.tensor(
+                    [[_rounded_fraction(v) for v in row] for row in [first, *inverse]], dtype=torch.float64
+                )
+                if vertices.requires_grad:
+                    # Retain the inverse's vertex dependence for higher derivatives while correcting
+                    # its value to the exact Jacobian. Point derivatives use no overflowed dot products.
+                    physical = _times_power_of_two(
+                        self._inverse[cell], -self._edge_exponent[cell, :, None] - self._axis_exponent[cell, None, :]
+                    )
+                    approximate = torch.cat([-physical.sum(dim=0, keepdim=True), physical])
+                    finite = torch.where(torch.isfinite(approximate), approximate, 0.0)
+                    jacobian = jacobian + (finite - finite.detach())
+                values = _ExactBarycentric.apply(p[indices], vertices, values, jacobian)
+            result[indices, cell] = values
         return result
 
     def locate(self, x: Any, *, tol: float = 1e-8, batch_size: int = 1024) -> Points:
