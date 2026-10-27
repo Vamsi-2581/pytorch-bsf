@@ -2,9 +2,12 @@
 
 import itertools
 import math
+import warnings
 from collections import Counter
 from fractions import Fraction
+from typing import Any
 
+import numpy as np
 import pytest
 import torch
 from hypothesis import given
@@ -28,7 +31,17 @@ from tests.strategies import (
 from torch_bsf import BezierModel, BezierSpace, Points
 from torch_bsf._kernels.combinatorics import _indices
 from torch_bsf.geometry import SimploidalSet
-from torch_bsf.interpolation import SimplicialMesh, estimate_gradients, hermite_interpolant, refinement_indicator
+from torch_bsf.interpolation import (
+    SimplicialMesh,
+    _Bisection,
+    _overlapping_boxes,
+    estimate_gradients,
+    hermite_interpolant,
+    lattice_mesh,
+    refine,
+    refinement_indicator,
+)
+from torch_bsf.sampling import grid
 from torch_bsf.splitting import subdivide
 
 # ---------------------------------------------------------------------------
@@ -200,7 +213,12 @@ def test_rows_match_explicit_identification():
 def test_predictions_agree_across_shared_faces(dim, n, clamp):
     x, simplices = _kuhn_mesh(dim, n, jitter=0.3)
     mesh = SimplicialMesh(x, simplices)
-    model = hermite_interpolant(mesh, _kinked(x), clamp=clamp)
+    _assert_continuous(mesh, hermite_interpolant(mesh, _kinked(x), clamp=clamp))
+
+
+def _assert_continuous(mesh: SimplicialMesh, model: BezierModel) -> None:
+    """Predictions from the two sides of every shared face agree."""
+    dim = mesh.dimension
     gen = torch.Generator().manual_seed(1)
     rows = mesh.simplices.tolist()
     checked = 0
@@ -370,6 +388,234 @@ def test_delaunay_mesh():
     model = hermite_interpolant(mesh, _quadratic(x), clamp=False)
     p = torch.rand(100, 2, generator=gen, dtype=torch.float64)
     torch.testing.assert_close(model(mesh.locate(p)), _quadratic(p), atol=1e-11, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# Conforming meshes: detection, lattice meshes and refinement
+# ---------------------------------------------------------------------------
+
+
+def _flat_quad_with_crossed_diagonals() -> tuple[list[list[float]], list[list[int]]]:
+    """Two pyramids on the unit square whose tetrahedra split it along different diagonals."""
+    vertices = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [0.5, 0.5, 1.0], [0.5, 0.5, -1.0]]
+    return vertices, [[0, 1, 3, 4], [0, 2, 3, 4], [0, 1, 2, 5], [1, 2, 3, 5]]
+
+
+def test_non_conforming_mesh_is_rejected():
+    vertices, simplices = _flat_quad_with_crossed_diagonals()
+    with pytest.raises(ValueError, match="not conforming"):
+        SimplicialMesh(vertices, simplices)
+    with pytest.warns(UserWarning, match="not conforming"):
+        mesh = SimplicialMesh(vertices, simplices, strict=False)
+    assert mesh.unmatched_faces == 4
+    # Splitting both halves along the same diagonal makes it conforming.
+    assert SimplicialMesh(vertices, [[0, 1, 3, 4], [0, 2, 3, 4], [0, 1, 3, 5], [0, 2, 3, 5]]).unmatched_faces == 0
+
+
+def test_hanging_vertex_and_crowded_face_are_detected():
+    # A triangle against two triangles that meet at the midpoint of its edge.
+    hanging = [[0.0, 0.0], [2.0, 0.0], [0.0, 2.0], [2.0, 2.0], [1.0, 1.0]]
+    with pytest.warns(UserWarning):
+        assert SimplicialMesh(hanging, [[0, 1, 2], [1, 4, 3], [4, 2, 3]], strict=False).unmatched_faces == 3
+    # Three triangles on one edge.
+    with pytest.raises(ValueError, match="not conforming"):
+        SimplicialMesh([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, -1.0], [1.0, 1.0]], [[0, 1, 2], [0, 1, 3], [0, 1, 4]])
+
+
+def test_nearby_components_are_conforming():
+    """Faces close to, but not touching, another part of the mesh are boundary faces."""
+    gap = torch.tensor([[0.0], [1.0], [1.0000005], [2.0]], dtype=torch.float64)
+    assert SimplicialMesh(gap, [[0, 1], [2, 3]]).unmatched_faces == 0
+    # A narrow slit between two triangles.
+    slit = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1e-7], [0.0, 1.0 + 1e-7], [1.0, 1.0]], dtype=torch.float64)
+    assert SimplicialMesh(slit, [[0, 1, 2], [3, 4, 5]]).unmatched_faces == 0
+    # Components of very different sizes: a large cell does not make distinct points coincide in 1-D, nor
+    # a parallel edge 1e-4 away coplanar in 2-D.
+    scales = torch.tensor([[0.0], [1e9], [1e9 + 0.5], [1e9 + 1.5]], dtype=torch.float64)
+    assert SimplicialMesh(scales, [[0, 1], [2, 3]]).unmatched_faces == 0
+    tall = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.5, 1e6], [0.5, -1e-4], [1.5, -1e-4], [1.0, -1.0]], dtype=torch.float64)
+    assert SimplicialMesh(tall, [[0, 1, 2], [3, 4, 5]]).unmatched_faces == 0
+    # Long parallel bases 0.5 apart, with the cells on the far sides of the gap.
+    long = torch.tensor([[0.0, 0.0], [1e9, 0.0], [5e8, 1.0], [0.0, -0.5], [1e9, -0.5], [5e8, -1.5]], dtype=torch.float64)
+    assert SimplicialMesh(long, [[0, 1, 2], [3, 4, 5]]).unmatched_faces == 0
+    # Far from the origin, the faces of one simplex stay distinct and a lattice stays conforming.
+    assert SimplicialMesh(torch.tensor([[1e15], [1e15 + 10]], dtype=torch.float64), [[0, 1]]).unmatched_faces == 0
+    far = torch.tensor([[1e15], [1e15 + 10], [1e15 + 10.25], [1e15 + 20]], dtype=torch.float64)  # a gap of 2 ulps
+    assert SimplicialMesh(far, [[0, 1], [2, 3]]).unmatched_faces == 0
+    for k in [3, 4]:
+        lattice = lattice_mesh(2, k)
+        assert SimplicialMesh(lattice.vertices + 1e12, lattice.simplices).unmatched_faces == 0
+
+
+def test_faces_overlapping_near_their_ends_are_detected():
+    """Faces overlapping only in a sliver away from their centroids and midpoints are still unmatched."""
+    # Triangles above and below the x-axis with bases [0, 10] and [9.9, 20], which overlap on [9.9, 10].
+    plane = torch.tensor([[0.0, 0.0], [10.0, 0.0], [5.0, 1.0], [9.9, 0.0], [20.0, 0.0], [15.0, -1.0]], dtype=torch.float64)
+    with pytest.raises(ValueError, match="2 faces"):
+        SimplicialMesh(plane, [[0, 1, 2], [3, 4, 5]])
+    # The same in 3-D: tetrahedra above and below z = 0 whose bases overlap near a corner of each.
+    space = torch.tensor(
+        [[0, 0, 0], [10, 0, 0], [0, 10, 0], [1, 1, 1], [9.8, 0.1, 0], [20, 0, 0], [9.8, 10, 0], [12, 3, -1]],
+        dtype=torch.float64,
+    )
+    with pytest.warns(UserWarning):
+        assert SimplicialMesh(space, [[0, 1, 2, 3], [4, 5, 6, 7]], strict=False).unmatched_faces == 2
+    # Bases [0, 1] and [1 - 1e-10, 2]: an overlap far thinner than the coplanarity tolerance, but wider than
+    # rounding, still counts.
+    sliver = torch.tensor(
+        [[0.0, 0.0], [1.0, 0.0], [0.3, 1.0], [1.0 - 1e-10, 0.0], [2.0, 0.0], [1.5, -1.0]], dtype=torch.float64
+    )
+    with pytest.raises(ValueError, match="2 faces"):
+        SimplicialMesh(sliver, [[0, 1, 2], [3, 4, 5]])
+    with pytest.warns(UserWarning):
+        assert SimplicialMesh(sliver, [[0, 1, 2], [3, 4, 5]], strict=False).unmatched_faces == 2
+    # Faces that meet at a common edge touch only up to rounding, even far from the origin.
+    lattice = lattice_mesh(3, 4)
+    far = SimplicialMesh(lattice.vertices * 7.3 + 1e5, lattice.simplices)
+    assert refine(far, list(range(0, far.n_simplices, 5))).unmatched_faces == 0
+    # A point in common with the other face is not an overlap; nor is a separate copy of a vertex in 1-D.
+    plane[3, 0] = 10.0
+    assert SimplicialMesh(plane, [[0, 1, 2], [3, 4, 5]]).unmatched_faces == 0
+    line = torch.tensor([[0.0], [1.0], [1.0], [2.0]], dtype=torch.float64)
+    with pytest.warns(UserWarning):
+        assert SimplicialMesh(line, [[0, 1], [2, 3]], strict=False).unmatched_faces == 2
+
+
+@pytest.mark.parametrize("dim, n", MESHES)
+def test_boundary_faces_are_not_unmatched(dim, n):
+    x, simplices = _kuhn_mesh(dim, n, jitter=0.3)
+    assert SimplicialMesh(x, simplices).unmatched_faces == 0
+
+
+@pytest.mark.parametrize("dim", [1, 2, 3])
+@pytest.mark.parametrize("k", [1, 2, 3, 4, 6])
+def test_lattice_mesh(dim, k):
+    mesh = lattice_mesh(dim, k)
+    assert mesh.n_simplices == k**dim
+    assert mesh.unmatched_faces == 0
+    volumes = mesh.volumes()
+    assert (volumes > 0).all()
+    torch.testing.assert_close(volumes, torch.full_like(volumes, 1 / (math.factorial(dim) * k**dim)))
+    expected = grid(BezierSpace.simplex(dim, degree=1), resolution=k).parameters[:, :dim]
+    torch.testing.assert_close(mesh.vertices, expected.double(), atol=1e-12, rtol=0)
+
+
+@pytest.mark.parametrize("dim, k", [(1, 6), (2, 4), (3, 3)])
+@pytest.mark.parametrize("clamp", [False, True])
+def test_lattice_mesh_interpolant(dim, k, clamp):
+    """On a lattice mesh the interpolant reproduces quadratics and is continuous."""
+    mesh = lattice_mesh(dim, k)
+    x = mesh.vertices
+    _assert_continuous(mesh, hermite_interpolant(mesh, _kinked(x), clamp=clamp))
+    if not clamp:
+        points = _random_points_in_cells(mesh, 5)
+        model = hermite_interpolant(mesh, _quadratic(x), clamp=False)
+        torch.testing.assert_close(model(points), _quadratic(_global_positions(mesh, points)), atol=1e-10, rtol=0)
+
+
+def test_delaunay_of_lattice_is_not_conforming():
+    """The documented pitfall: removing qhull's flat simplices from a lattice leaves hanging faces."""
+    spatial = pytest.importorskip("scipy.spatial")
+    x = lattice_mesh(3, 4).vertices
+    tri = spatial.Delaunay(x.numpy(), qhull_options="Qbb Qc Qz Q12 Qt")
+    s = torch.as_tensor(tri.simplices)
+    flat = torch.linalg.det(x[s[:, 1:]] - x[s[:, :1]]).abs() < 1e-9
+    assert flat.any()
+    with pytest.raises(ValueError, match="not conforming"):
+        SimplicialMesh(x, s[~flat])
+
+
+@pytest.mark.parametrize("dim", [1, 2, 3])
+@pytest.mark.parametrize("start", ["lattice", "jittered"])
+def test_refine_keeps_mesh_conforming(dim, start):
+    mesh = lattice_mesh(dim, 2) if start == "lattice" else SimplicialMesh(*_kuhn_mesh(dim, 2, jitter=0.3))
+    total = mesh.volumes().sum()
+    gen = torch.Generator().manual_seed(dim)
+    for _ in range(20):
+        k = int(torch.randint(mesh.n_simplices, (1,), generator=gen))
+        target = mesh.simplices[k].tolist()
+        fine = refine(mesh, [k])
+        assert fine.unmatched_faces == 0
+        assert fine.n_vertices > mesh.n_vertices
+        torch.testing.assert_close(fine.vertices[: mesh.n_vertices], mesh.vertices, atol=0, rtol=0)
+        assert target not in fine.simplices.tolist()
+        torch.testing.assert_close(fine.volumes().sum(), total)
+        for v in range(mesh.n_vertices, fine.n_vertices):  # every new vertex is a midpoint of older vertices
+            mid = (fine.vertices[:v, None] + fine.vertices[None, :v]) / 2
+            assert ((mid - fine.vertices[v]).abs().amax(dim=2) < 1e-12).any()
+        mesh = fine
+    x = mesh.vertices
+    _assert_continuous(mesh, hermite_interpolant(mesh, _kinked(x)))
+    points = _random_points_in_cells(mesh, 3)
+    model = hermite_interpolant(mesh, _quadratic(x), clamp=False)
+    torch.testing.assert_close(model(points), _quadratic(_global_positions(mesh, points)), atol=1e-10, rtol=0)
+
+
+def _kuhn_simplices_by_rejection(dim: int, k: int) -> list[list[int]]:
+    """The simplices of lattice_mesh, found by trying every corner and axis order."""
+    lattice = [alpha for (alpha,) in _indices((dim,), (k,))]
+    number = {tuple(itertools.accumulate(a[:dim])): n for n, a in enumerate(lattice)}
+    simplices = []
+    for corner in itertools.product(range(k), repeat=dim):
+        for order in itertools.permutations(range(dim)):
+            z = list(corner)
+            path = [number.get(tuple(z))]
+            for axis in order:
+                z[axis] += 1
+                path.append(number.get(tuple(z)))
+            if None not in path:
+                simplices.append(sorted(v for v in path if v is not None))
+    return simplices
+
+
+@pytest.mark.parametrize("dim", [1, 2, 3, 4])
+def test_lattice_mesh_generates_only_valid_simplices(dim):
+    for k in range(1, 6 if dim < 4 else 4):
+        assert lattice_mesh(dim, k).simplices.tolist() == _kuhn_simplices_by_rejection(dim, k)
+
+
+def test_lattice_mesh_in_high_dimension():
+    mesh = lattice_mesh(12, 1)  # 12! axis orders would be tried by rejection
+    assert (mesh.n_simplices, mesh.n_vertices, mesh.unmatched_faces) == (1, 13, 0)
+
+
+def test_refine_midpoints_do_not_overflow():
+    mesh = SimplicialMesh(torch.tensor([[1e308], [1.2e308]], dtype=torch.float64), [[0, 1]])
+    fine = refine(mesh, [0])
+    torch.testing.assert_close(fine.vertices[2], torch.tensor([1.1e308], dtype=torch.float64))
+
+
+def test_refine_bisects_longest_edge_and_closes_neighbours():
+    # Two right triangles sharing the hypotenuse: refining one must bisect the other as well.
+    mesh = SimplicialMesh([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], [[0, 1, 2], [1, 2, 3]])
+    fine = refine(mesh, [0])
+    torch.testing.assert_close(fine.vertices[4], torch.tensor([0.5, 0.5], dtype=torch.float64))
+    assert fine.simplices.tolist() == [[0, 1, 4], [0, 2, 4], [1, 3, 4], [2, 3, 4]]
+    # A neighbour whose longest edge is another one is bisected there first, which adds more vertices.
+    flat = SimplicialMesh(
+        torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.5, 0.2], [0.5, -2.0]], dtype=torch.float64), [[0, 1, 2], [0, 1, 3]]
+    )
+    fine = refine(flat, [0])
+    assert fine.n_vertices > 5
+    assert [0, 1, 2] not in fine.simplices.tolist()
+    assert all(not {0, 1} <= set(s) for s in fine.simplices.tolist())  # the shared edge was bisected
+    lattice = lattice_mesh(2, 2)
+    assert refine(lattice, []).simplices.tolist() == sorted(lattice.simplices.tolist())
+
+
+def test_invalid_lattice_and_refine_arguments():
+    for dim, k in [(0, 2), (2, 0), (True, 2), (2, 1.5)]:
+        with pytest.raises(ValueError):
+            lattice_mesh(dim, k)  # type: ignore[arg-type]
+    lattice = lattice_mesh(2, 2)
+    for selector in [4, 1.9, 1.0, "1", True, torch.tensor(1.0), torch.tensor(True)]:
+        with pytest.raises(ValueError, match="indices"):
+            refine(lattice, [selector])  # type: ignore[list-item]
+    expected = refine(lattice, [1]).simplices
+    indices: list[Any] = [np.int64(1), torch.tensor(1), torch.tensor([1])[0]]
+    for index in indices:
+        torch.testing.assert_close(refine(lattice, [index]).simplices, expected)
+    torch.testing.assert_close(refine(lattice, torch.tensor([1])).simplices, expected)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -837,3 +1083,244 @@ def test_refinement_score_of_a_simplex_whose_volume_overflows():
     expected = refinement_indicator(unit, [0.0, 0.0, 1.0], gradients=[[[0.0], [0.0]], [[0.0], [0.0]], [[0.0], [3.0]]])
     actual = refinement_indicator(big, [0.0, 0.0, 1.0], gradients=[[[0.0], [0.0]], [[0.0], [0.0]], [[0.0], [3.0 * 2.0**-25]]])
     assert 0 < expected.item() < 0.5 and actual.tolist() == [math.ldexp(expected.item(), 1025)]
+
+
+@pytest.mark.parametrize("vertices", [[[1.0], [1.0]], [[2.0, 3.0], [2.0, 3.0], [2.0, 3.0]], [[1e12], [1e12 + 1e-6]]])
+def test_mesh_rejects_coincident_vertices_as_degenerate(vertices):
+    simplices = [list(range(len(vertices)))]
+    with pytest.raises(ValueError, match="degenerate"):
+        SimplicialMesh(torch.tensor(vertices, dtype=torch.float64), simplices)
+
+
+def test_kuhn_mesh_is_conforming_at_extreme_and_anisotropic_scales():
+    """Faces overflowed or underflowed when compared in the given coordinates, so a Kuhn mesh scaled to 1e+-300 or
+    with axes of very different scales was reported as not conforming."""
+    lattice = lattice_mesh(3, 2)
+    for factors in ([1e-300] * 3, [1e300] * 3, [1.0, 1e-100, 1.0], [1e200, 1e-200, 1e100]):
+        mesh = SimplicialMesh(lattice.vertices * torch.tensor(factors, dtype=torch.float64), lattice.simplices)
+        assert mesh.unmatched_faces == 0
+
+
+@pytest.mark.parametrize("scale", [1e-200, 1e200])
+def test_volumes_and_location_at_extreme_scales(scale):
+    lattice = lattice_mesh(2, 4)
+    x = lattice.vertices * scale
+    mesh = SimplicialMesh(x, lattice.simplices)
+    torch.testing.assert_close(mesh.volumes(), lattice.volumes() * scale * scale)
+    first = mesh.simplices[0]
+    torch.testing.assert_close(mesh.barycentric(x[first[1:2]])[0, 0], torch.tensor([0.0, 1.0, 0.0], dtype=torch.float64))
+
+
+def test_volumes_of_anisotropic_simplex_are_exact():
+    mesh = SimplicialMesh(torch.tensor([[0.0, 0.0], [1e200, 0.0], [0.0, 1e-100]], dtype=torch.float64), [[0, 1, 2]])
+    torch.testing.assert_close(mesh.volumes(), torch.tensor([5e99], dtype=torch.float64))
+
+
+def test_refine_picks_the_longest_edge_beyond_the_square_overflow():
+    x = torch.tensor([[0.0, 0.0], [1.7e154, 0.0], [0.3e154, 0.4e154]], dtype=torch.float64)
+    fine = refine(SimplicialMesh(x, [[0, 1, 2]]), [0])
+    torch.testing.assert_close(fine.vertices[3], torch.tensor([0.85e154, 0.0], dtype=torch.float64))
+
+
+@given(data=st.data())
+def test_kuhn_mesh_stays_conforming_under_any_scaling_or_translation(data):
+    """Conformity depends neither on the units of the axes (up to 2**+-1000 each) nor on a translation up to 1e12."""
+    x, simplices = data.draw(kuhn_meshes(), label="mesh")
+    scale = data.draw(axis_scalings(x.shape[1]), label="scale")
+    t = data.draw(translations(x.shape[1]), label="t")
+    assert SimplicialMesh(x * scale, simplices).unmatched_faces == 0
+    assert SimplicialMesh(x + t, simplices).unmatched_faces == 0
+
+
+@given(data=st.data())
+def test_hanging_vertex_is_detected_under_any_scaling(data):
+    """Bisecting an interior edge in one simplex only leaves a hanging vertex, however the axes are scaled."""
+    x, simplices = data.draw(kuhn_meshes(dimensions=(2, 3)), label="mesh")
+    first = simplices[0].tolist()
+    shared = [(a, b) for a, b in itertools.combinations(first, 2) if sum(a in s and b in s for s in simplices.tolist()) > 1]
+    a, b = data.draw(st.sampled_from(shared), label="edge")
+    x, hanging = _with_hanging_vertex(x, simplices, a, b)
+    scale = data.draw(axis_scalings(x.shape[1]), label="scale")
+    with pytest.warns(UserWarning, match="not conforming"):
+        mesh = SimplicialMesh(x * scale, hanging, strict=False)
+    assert mesh.unmatched_faces > 0
+
+
+@given(data=st.data())
+def test_refine_keeps_the_mesh_conforming_and_commutes_with_scaling(data):
+    """Refinement fills the same domain with a conforming mesh, and scaling by a power of two before or after it
+    gives the same mesh exactly, since edge lengths and midpoints scale exactly."""
+    x, simplices = data.draw(kuhn_meshes(), label="mesh")
+    mesh = SimplicialMesh(x, simplices)
+    chosen = data.draw(st.lists(st.integers(0, mesh.n_simplices - 1), max_size=3), label="simplices")
+    fine = refine(mesh, chosen)
+    assert fine.unmatched_faces == 0
+    assert fine.n_simplices >= mesh.n_simplices + (len(chosen) > 0)
+    torch.testing.assert_close(fine.volumes().sum(), mesh.volumes().sum(), rtol=1e-12, atol=0)
+    scale = data.draw(extreme_scalings(), label="scale")
+    scaled = refine(SimplicialMesh(x * scale, simplices), chosen)
+    assert torch.equal(scaled.vertices, fine.vertices * scale)
+    assert torch.equal(scaled.simplices, fine.simplices)
+
+
+@pytest.mark.parametrize(
+    "vertices, simplices",
+    [
+        ([[0.0], [1.0], [3.0]], [[0, 1], [1, 2], [0, 2]]),
+        ([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [2.0, 3.0]], [[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]]),
+    ],
+)
+def test_mesh_without_boundary_faces_is_not_conforming(vertices, simplices):
+    """Regression test (Codex review of #430): with every face in two simplices, the overlapping simplices left no
+    boundary face to compare, and indexing the empty face list raised IndexError."""
+    with pytest.raises(ValueError, match="not conforming"):
+        SimplicialMesh(vertices, simplices)
+    with pytest.warns(UserWarning, match="not conforming"):
+        mesh = SimplicialMesh(vertices, simplices, strict=False)
+    assert mesh.unmatched_faces == len(simplices) * (len(vertices[0]) + 1) // 2  # every face, each in two simplices
+
+
+@given(data=st.data())
+def test_any_simplex_list_is_accepted_or_rejected_with_value_error(data):
+    """Arbitrary simplices on a few points, overlapping or not, give a mesh or a ValueError, never another error."""
+    d = data.draw(st.integers(1, 3), label="d")
+    n = data.draw(st.integers(d + 1, d + 4), label="n_vertices")
+    coordinate = st.integers(-4, 4).map(float)
+    x = data.draw(st.lists(st.lists(coordinate, min_size=d, max_size=d), min_size=n, max_size=n), label="vertices")
+    all_simplices = [list(c) for c in itertools.combinations(range(n), d + 1)]
+    simplices = data.draw(st.lists(st.sampled_from(all_simplices), min_size=1, unique_by=tuple), label="simplices")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        try:
+            mesh = SimplicialMesh(x, simplices, strict=False)
+        except ValueError:
+            return
+    assert mesh.unmatched_faces >= 0
+
+
+def test_components_of_opposite_scales_are_compared_on_their_own_scales():
+    """Regression test (Codex review of #430): scaling all coordinates by the largest underflowed the endpoints of the
+    small intervals to zero, so that their faces coincided and the conforming mesh was rejected."""
+    mesh = SimplicialMesh([[0.0], [1e-300], [2e-300], [3e-300], [1e300], [1.1e300]], [[0, 1], [2, 3], [4, 5]])
+    assert mesh.unmatched_faces == 0
+
+
+def _with_hanging_vertex(x: torch.Tensor, simplices: torch.Tensor, a: int, b: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """``simplices[0]`` bisected at the midpoint of its edge ``(a, b)``, leaving its neighbours across the edge whole."""
+    first = simplices[0].tolist()
+    x = torch.cat([x, (x[a] + x[b])[None] / 2])
+    m = len(x) - 1
+    halves = [[m if v == a else v for v in first], [m if v == b else v for v in first]]
+    return x, torch.cat([simplices[1:], torch.tensor(halves)])
+
+
+@given(data=st.data())
+def test_components_at_independent_scales_are_checked_on_their_own(data):
+    """A conforming mesh and a mesh with a hanging vertex, scaled by independent powers of two up to 2**+-1000 and
+    side by side, give exactly the unmatched faces of the second one alone."""
+    x, simplices = data.draw(kuhn_meshes(dimensions=(2, 3)), label="mesh")
+    first = simplices[0].tolist()
+    shared = [(a, b) for a, b in itertools.combinations(first, 2) if sum(a in s and b in s for s in simplices.tolist()) > 1]
+    a, b = data.draw(st.sampled_from(shared), label="edge")
+    y, hanging = _with_hanging_vertex(x, simplices, a, b)
+    with pytest.warns(UserWarning, match="not conforming"):
+        expected = SimplicialMesh(y, hanging, strict=False).unmatched_faces
+    s, t = data.draw(extreme_scalings(), label="s"), data.draw(extreme_scalings(), label="t")
+    # The second component lies in [-2t, -t]^d, apart from the first in [0, s]^d.
+    union = torch.cat([x * s, -(y + 1) * t])
+    with pytest.warns(UserWarning, match="not conforming"):
+        mesh = SimplicialMesh(union, torch.cat([simplices, hanging + len(x)]), strict=False)
+    assert mesh.unmatched_faces == expected > 0
+
+
+def test_hanging_vertex_off_its_edge_by_rounding_is_detected():
+    """Found by Hypothesis: after a translation, a hanging vertex lies off its edge by a unit of rounding, which made
+    the pair of faces look extremely thin along one axis; scaling that axis on its own then hid the overlap."""
+    y = torch.tensor(
+        [[0.0, 0.0], [0.0, 0.5], [0.0, 1.0], [0.5, 0.0], [0.5000000000000006, 0.5], [0.5, 1.0], [1.0, 0.0], [1.0, 0.5]]
+        + [[1.0, 1.0], [0.5000000000000002, 0.25]],
+        dtype=torch.float64,
+    )
+    simplices = [[0, 1, 4], [1, 4, 5], [1, 2, 5], [3, 6, 7], [3, 4, 7], [4, 7, 8], [4, 5, 8], [0, 9, 4], [0, 3, 9]]
+    for x in (y, -(y + 1), (y + 1) * 2.0**-1000):
+        with pytest.warns(UserWarning, match="not conforming"):
+            assert SimplicialMesh(x, simplices, strict=False).unmatched_faces == 3
+
+
+def test_faces_spanning_the_float64_range_are_compared():
+    """Regression test (Codex review of #430): the extent of a face from -1e308 to 1e308 overflowed, so that unrelated
+    faces became candidates and their coordinates non-finite."""
+    mesh = SimplicialMesh([[0, 0], [-1e308, 0], [1e308, 1e308], [0, -1], [1, -1], [0, -2]], [[0, 1, 2], [3, 4, 5]])
+    assert mesh.unmatched_faces == 0
+    x = torch.tensor([[0.0, 1e308], [0.0, -1e308], [-1e308, 0.0], [1e308, 0.0], [0.0, 0.0]], dtype=torch.float64)
+    assert SimplicialMesh(x, [[0, 2, 3], [1, 2, 3]]).unmatched_faces == 0
+    with pytest.warns(UserWarning, match="not conforming"):
+        assert SimplicialMesh(x, [[0, 2, 4], [0, 3, 4], [1, 2, 3]], strict=False).unmatched_faces == 3
+
+
+def test_longest_edge_is_found_beyond_the_float64_range():
+    """An edge whose difference overflows is the longest, not of length zero."""
+    x = [torch.tensor(v, dtype=torch.float64) for v in ([0.0, 1e308], [-1e308, 0.0], [1e308, 0.0])]
+    assert _Bisection(x, [(0, 1, 2)]).longest((0, 1, 2)) == (1, 2)
+
+
+@given(data=st.data())
+def test_conformity_of_meshes_spanning_the_float64_range(data):
+    """Stretched over [-2**1023, 2**1023] per axis, where differences of coordinates overflow, a mesh is either
+    rejected for that reason or judged as at scale one: conforming, or with its hanging vertex found."""
+    x, simplices = data.draw(kuhn_meshes(dimensions=(2, 3)), label="mesh")
+    if data.draw(st.booleans(), label="hanging"):
+        first = simplices[0].tolist()
+        pairs = itertools.combinations(first, 2)
+        shared = [(a, b) for a, b in pairs if sum(a in s and b in s for s in simplices.tolist()) > 1]
+        x, simplices = _with_hanging_vertex(x, simplices, *data.draw(st.sampled_from(shared), label="edge"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        expected = SimplicialMesh(x, simplices, strict=False).unmatched_faces
+        try:
+            mesh = SimplicialMesh((2 * x - 1) * 2.0**1023, simplices, strict=False)
+        except ValueError as error:
+            assert "too far apart" in str(error)
+            return
+    assert mesh.unmatched_faces == expected
+
+
+def test_refine_midpoints_are_correctly_rounded():
+    """Halving both ends before adding rounded twice among subnormal numbers (Codex review of #430)."""
+    x = [torch.tensor([v], dtype=torch.float64) for v in (3 * 2.0**-1074, 6 * 2.0**-1074)]
+    bisection = _Bisection(x, [(0, 1)])
+    bisection.bisect((0, 1))
+    # The midpoint 4.5 units rounds to 4 (to even); halving 3 first gives 2 (to even), so the sum of halves is 5.
+    assert bisection.x[2].item() == 4 * 2.0**-1074
+
+
+def test_mesh_helpers_are_exported_from_the_package():
+    """Regression test (Codex review of #430): the new helpers were missing from the package root."""
+    import torch_bsf
+
+    assert torch_bsf.lattice_mesh is lattice_mesh and torch_bsf.refine is refine
+    assert {"lattice_mesh", "refine"} <= set(torch_bsf.__all__)
+
+
+@given(data=st.data())
+def test_box_sweep_finds_exactly_the_meeting_pairs(data):
+    """The sweep along the first axis returns the same pairs as comparing all of them (Codex review of #430: the
+    comparison of all pairs took quadratic time for meshes of many separate components)."""
+    d = data.draw(st.integers(1, 3), label="d")
+    n = data.draw(st.integers(0, 30), label="n")
+    coordinate = st.integers(-6, 6).map(float)
+    corners = data.draw(st.lists(st.lists(coordinate, min_size=2 * d, max_size=2 * d), min_size=n, max_size=n))
+    box = torch.tensor(corners, dtype=torch.float64).reshape(n, 2, d)
+    low, high = box.amin(dim=1), box.amax(dim=1)
+    slack = torch.tensor(data.draw(st.lists(st.sampled_from([0.0, 0.5, 1.0]), min_size=n, max_size=n)), dtype=torch.float64)
+    own = torch.tensor(data.draw(st.lists(st.integers(0, 3), min_size=n, max_size=n)), dtype=torch.long)
+    first, second = _overlapping_boxes(low, high, slack, own)
+    found = {frozenset(p) for p in zip(first.tolist(), second.tolist(), strict=True)}
+    assert len(found) == len(first)  # each pair once
+    expected = {
+        frozenset((a, b))
+        for a, b in itertools.combinations(range(n), 2)
+        if own[a] != own[b]
+        and bool(((low[a] <= high[b] + max(slack[a], slack[b])) & (low[b] <= high[a] + max(slack[a], slack[b]))).all())
+    }
+    assert found == expected
