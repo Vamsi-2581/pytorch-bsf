@@ -80,6 +80,21 @@ def _times_power_of_two(x: torch.Tensor, exponent: torch.Tensor) -> torch.Tensor
     return x * torch.pow(two, first) * torch.pow(two, second) * torch.pow(two, e - first - second)
 
 
+class _Frexp(torch.autograd.Function):
+    """Differentiate frexp without materializing an infinite scale factor for subnormal inputs."""
+
+    @staticmethod
+    def forward(ctx: Any, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        mantissa, exponent = torch.frexp(value)
+        ctx.save_for_backward(exponent)
+        return mantissa, exponent
+
+    @staticmethod
+    def backward(ctx: Any, gradient: torch.Tensor, exponent_gradient: None) -> torch.Tensor:
+        (exponent,) = ctx.saved_tensors
+        return _times_power_of_two(gradient, -exponent)
+
+
 def _equilibrate(
     mantissa: torch.Tensor, exponent: torch.Tensor, axis_exponent: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -240,19 +255,35 @@ class _ExactBarycentric(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx: Any, points: torch.Tensor, vertices: torch.Tensor, values: torch.Tensor, jacobian: torch.Tensor
+        ctx: Any,
+        points: torch.Tensor,
+        vertices: torch.Tensor,
+        values: torch.Tensor,
+        mantissa: torch.Tensor,
+        exponent: torch.Tensor,
     ) -> torch.Tensor:
         result = values.clone()
-        ctx.save_for_backward(result, jacobian)
+        ctx.save_for_backward(result, mantissa, exponent)
         return result
 
     @staticmethod
-    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None, None]:
-        values, jacobian = ctx.saved_tensors
-        point_gradient = gradient @ jacobian
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None, None, None]:
+        values, mantissa, exponent = ctx.saved_tensors
+        # Scale after applying the upstream gradient: an unrepresentable Jacobian entry can still
+        # contribute a finite gradient, and a zero upstream gradient must not multiply infinity.
+        upstream, upstream_power = _Frexp.apply(gradient)
+        point_gradient = _times_power_of_two(
+            upstream[:, :, None] * mantissa[None], upstream_power[:, :, None] + exponent[None]
+        ).sum(dim=1)
         # d lambda_i / d vertex_j = -lambda_j * d lambda_i / d point.
-        vertex_gradient = -values.T @ point_gradient
-        return point_gradient, vertex_gradient, None, None
+        # Apply the weights before rounding: a tiny point gradient can underflow even when its
+        # product with a large barycentric weight is a finite, nonzero vertex gradient.
+        weights, weight_power = _Frexp.apply(values)
+        vertex_gradient = -_times_power_of_two(
+            weights[:, :, None, None] * upstream[:, None, :, None] * mantissa[None, None],
+            weight_power[:, :, None, None] + upstream_power[:, None, :, None] + exponent[None, None],
+        ).sum(dim=(0, 2))
+        return point_gradient, vertex_gradient, None, None, None
 
 
 def _length_key(a: torch.Tensor, b: torch.Tensor) -> tuple[int, float]:
@@ -332,7 +363,7 @@ class SimplicialMesh:
         # `unit` do not. Two choices of axis exponents are tried: one per axis, from the extent of the simplex
         # along it, under which scaling an axis by a power of two changes only its exponent; and a common one,
         # which keeps the Euclidean shape. The first is used unless only the second gives a non-degenerate `unit`.
-        mantissa, exponent = torch.frexp(edges)
+        mantissa, exponent = _Frexp.apply(edges)
         exponent = torch.where(mantissa == 0, -(2**20), exponent.to(torch.long))  # zeros never set a scale
         per_axis = _equilibrate(mantissa, exponent, exponent.amax(dim=1))
         common = _equilibrate(mantissa, exponent, torch.zeros_like(exponent[:, 0]))
@@ -346,6 +377,14 @@ class SimplicialMesh:
         self.simplices = s
         # Maps (x - x_0) / 2**axis_exponent to barycentric coordinates 1..d times 2**edge_exponent.
         self._inverse = torch.linalg.inv(unit.transpose(1, 2))
+        # The final dot-product error alone misses rounding in the factorization of a nearly singular
+        # unit matrix. Also account for amplification when coordinates of differently scaled edges are
+        # recovered, even if a spurious inverse entry hides cancellation in the final dot product.
+        condition = unit.abs().sum(dim=1).amax(dim=1) * self._inverse.abs().sum(dim=2).amax(dim=1)
+        amplification = self._edge_exponent.amax(dim=1) - self._edge_exponent.amin(dim=1)
+        self._inexact_inverse = (8 * d * torch.finfo(torch.float64).eps) * _times_power_of_two(
+            condition, amplification
+        ) > 1e-12
         self._exact_inverses: dict[int, tuple[list[Fraction], list[list[Fraction]]]] = {}
         # Volumes are kept as mantissa * 2**exponent too, so that a product with a volume beyond the float64 range
         # (e.g. a refinement score) can still be finite.
@@ -506,7 +545,8 @@ class SimplicialMesh:
 
         Notes
         -----
-        The usual path uses the equilibrated float64 inverse. If an absolute-product estimate of roundoff
+        The usual path uses the equilibrated float64 inverse. If its condition estimate indicates excessive
+        factorization error, an absolute-product estimate of roundoff
         exceeds ``1e-12 * (1 + abs(coordinate))``, or the solve overflows, the affected point/simplex pairs
         are evaluated with exact rational arithmetic on the input floats and rounded once to float64.
         This slower path caches one exact inverse per affected simplex. It recovers coordinates lost by
@@ -523,6 +563,7 @@ class SimplicialMesh:
         magnitude = torch.cat([products.sum(dim=2, keepdim=True), products], dim=2)
         error = (8 * self.dimension * torch.finfo(torch.float64).eps) * magnitude
         uncertain = (error > 1e-12 * (1 + coordinates.abs())).any(dim=2) | ~torch.isfinite(coordinates).all(dim=2)
+        uncertain |= self._inexact_inverse[None]
         if not uncertain.any():
             return coordinates
         return self._exact_barycentric(p, coordinates, uncertain, offset)
@@ -552,19 +593,33 @@ class SimplicialMesh:
             values = torch.tensor(rows, dtype=torch.float64)
             if coordinates.requires_grad:
                 first = [-sum(column, Fraction(0)) for column in zip(*inverse, strict=True)]
-                jacobian = torch.tensor(
-                    [[_rounded_fraction(v) for v in row] for row in [first, *inverse]], dtype=torch.float64
+                jacobian = [first, *inverse]
+                powers = [[v.numerator.bit_length() - v.denominator.bit_length() for v in row] for row in jacobian]
+                # A zero first-row entry is a cancellation of the other rows: use their scale so its
+                # differentiable representation does not overflow before summing those rows.
+                for j, value in enumerate(first):
+                    if value == 0:
+                        powers[0][j] = max(row[j] for row in powers[1:])
+                exponent = torch.tensor(powers, dtype=torch.long)
+                mantissa = torch.tensor(
+                    [
+                        [float(v / Fraction(2) ** e) for v, e in zip(row, power, strict=True)]
+                        for row, power in zip(jacobian, powers, strict=True)
+                    ],
+                    dtype=torch.float64,
                 )
                 if vertices.requires_grad:
                     # Retain the inverse's vertex dependence for higher derivatives while correcting
                     # its value to the exact Jacobian. Point derivatives use no overflowed dot products.
-                    physical = _times_power_of_two(
-                        self._inverse[cell], -self._edge_exponent[cell, :, None] - self._axis_exponent[cell, None, :]
+                    physical_power = -self._edge_exponent[cell, :, None] - self._axis_exponent[cell, None, :]
+                    other = _times_power_of_two(self._inverse[cell], physical_power - exponent[1:])
+                    origin_row = -_times_power_of_two(self._inverse[cell], physical_power - exponent[0, None]).sum(
+                        dim=0, keepdim=True
                     )
-                    approximate = torch.cat([-physical.sum(dim=0, keepdim=True), physical])
+                    approximate = torch.cat([origin_row, other])
                     finite = torch.where(torch.isfinite(approximate), approximate, 0.0)
-                    jacobian = jacobian + (finite - finite.detach())
-                values = _ExactBarycentric.apply(p[indices], vertices, values, jacobian)
+                    mantissa = mantissa + (finite - finite.detach())
+                values = _ExactBarycentric.apply(p[indices], vertices, values, mantissa, exponent)
             result[indices, cell] = values
         return result
 

@@ -415,15 +415,20 @@ def test_exact_inverse_rejects_an_affinely_dependent_simplex():
         _rational_inverse(vertices)
 
 
-def test_exact_fallback_preserves_gradients_after_floating_products_overflow():
+@pytest.mark.parametrize("exponent, loss_exponent", [(980, 0), (1000, -100)])
+def test_exact_fallback_preserves_gradients_after_floating_products_overflow(exponent, loss_exponent):
     """Codex review: finite exact coordinates/Jacobians must not inherit the overflowed solve's zero gradient."""
-    length = 2.0**-980
+    length = 2.0**-exponent
     mesh = SimplicialMesh([[0.0, 0.0], [length, length], [length, length * (1 + 2.0**-37)]], [[0, 1, 2]])
     point = torch.tensor([[2.0**8, 2.0**8]], dtype=torch.float64, requires_grad=True)
     lam = mesh.barycentric(point)
-    torch.testing.assert_close(lam[0, 0], torch.tensor([1 - 2.0**988, 2.0**988, 0.0], dtype=torch.float64), rtol=0, atol=0)
-    gradient = torch.autograd.grad(lam[:, :, 2].sum(), point)[0]
-    torch.testing.assert_close(gradient, torch.tensor([[-(2.0**1017), 2.0**1017]], dtype=torch.float64), rtol=0, atol=0)
+    long_coordinate = 2.0 ** (exponent + 8)
+    torch.testing.assert_close(
+        lam[0, 0], torch.tensor([1 - long_coordinate, long_coordinate, 0.0], dtype=torch.float64), rtol=0, atol=0
+    )
+    gradient = torch.autograd.grad((lam[:, :, 2] * 2.0**loss_exponent).sum(), point)[0]
+    slope = 2.0 ** (exponent + 37 + loss_exponent)
+    torch.testing.assert_close(gradient, torch.tensor([[-slope, slope]], dtype=torch.float64), rtol=0, atol=0)
 
 
 def test_exact_fallback_preserves_vertex_and_second_derivatives():
@@ -437,6 +442,37 @@ def test_exact_fallback_preserves_vertex_and_second_derivatives():
     torch.testing.assert_close(vertex_gradient, -lam.detach()[0, 0, :, None] * jacobian, rtol=0, atol=0)
     second = torch.autograd.grad(point_gradient[0, 0], vertices)[0]
     assert second[2, 0].item() == -((1 / (2 * short)) ** 2)
+
+
+def test_exact_fallback_keeps_vertex_gradients_when_the_point_gradient_underflows():
+    """Large barycentrics must multiply the unrounded point gradient in the vertex pullback."""
+    large, small = 2.0**1000, 2.0**-1000
+    vertices = torch.tensor([[0.0, 0.0], [large, 0.0], [large, small]], dtype=torch.float64, requires_grad=True)
+    point = torch.tensor([[0.0, 1.0]], dtype=torch.float64, requires_grad=True)
+    lam = SimplicialMesh(vertices, [[0, 1, 2]]).barycentric(point)
+    point_gradient, vertex_gradient = torch.autograd.grad(lam[:, :, 1].sum() * 2.0**-100, (point, vertices))
+    assert point_gradient[0, 0].item() == 0.0  # the true 2**-1100 is below float64
+    torch.testing.assert_close(vertex_gradient[:, 0], torch.tensor([0.0, 2.0**-100, -(2.0**-100)], dtype=torch.float64))
+
+
+def test_locate_accounts_for_factorization_error_near_the_degeneracy_cutoff():
+    """Codex review: a small final dot product can hide a large error already present in the inverse."""
+    vertices = torch.tensor([[0.0, 0.0], [1.01, 1.05], [-1.01, -1.050000000005]], dtype=torch.float64)
+    mesh = SimplicialMesh(vertices, [[0, 1, 2]])
+    point = vertices[1:].mean(0)[None]
+    expected = torch.tensor([[0.0, 0.5, 0.5]], dtype=torch.float64)
+    torch.testing.assert_close(mesh.locate(point).parameters, expected, atol=1e-12, rtol=0)
+
+
+def test_exact_backward_ignores_unused_rows_with_unrepresentable_derivatives():
+    """Codex review: zero upstream weights must not multiply infinite Jacobian entries."""
+    vertices = torch.tensor([[0.0, 0.0], [1.9, 1e-300], [1.9, 1e-300 * (1 + 1e-11)]], dtype=torch.float64, requires_grad=True)
+    point = vertices.detach()[1:2].clone().requires_grad_(True)
+    lam = SimplicialMesh(vertices, [[0, 1, 2]]).barycentric(point)
+    point_gradient, vertex_gradient = torch.autograd.grad(lam[:, :, 0].sum(), (point, vertices))
+    torch.testing.assert_close(point_gradient, torch.tensor([[-1 / 1.9, 0.0]], dtype=torch.float64), rtol=0, atol=0)
+    expected = torch.tensor([[0.0, 0.0], [1 / 1.9, 0.0], [0.0, 0.0]], dtype=torch.float64)
+    torch.testing.assert_close(vertex_gradient, expected, rtol=0, atol=0)
 
 
 def test_locate_tolerance_and_outside_points():

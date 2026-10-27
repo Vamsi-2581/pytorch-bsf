@@ -82,7 +82,8 @@ every simplex, which is simple and exact but costs
 
 For very different edge lengths, solving for barycentric coordinates can
 amplify roundoff enough to reject even a mesh's own vertex. ``barycentric``
-estimates cancellation using absolute matrix products and recomputes the
+estimates factorization error from conditioning and edge scaling, and
+cancellation using absolute matrix products. It recomputes the
 affected point/simplex pairs with exact rational arithmetic on the input
 floats, rounding the resulting coordinates once to float64. Ordinary pairs
 keep the vectorized float64 path. The fallback is slower and caches one
