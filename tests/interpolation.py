@@ -35,6 +35,7 @@ from torch_bsf.interpolation import (
     SimplicialMesh,
     _Bisection,
     _overlapping_boxes,
+    _rational_inverse,
     estimate_gradients,
     hermite_interpolant,
     lattice_mesh,
@@ -405,6 +406,13 @@ def test_cancellation_fallback_keeps_barycentric_point_gradients():
     assert lam.tolist() == [[[0.5, 0.5, 0.0]]]
     gradient = torch.autograd.grad(lam[:, :, 2].sum(), point)[0]
     torch.testing.assert_close(gradient, torch.tensor([[1 / (2 * short), -1 / (2 * short)]], dtype=torch.float64))
+
+
+def test_exact_inverse_rejects_an_affinely_dependent_simplex():
+    """The exact solver must reject a truly singular triangle instead of dividing by a zero pivot."""
+    vertices = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float64)
+    with pytest.raises(ValueError, match="degenerate"):
+        _rational_inverse(vertices)
 
 
 def test_locate_tolerance_and_outside_points():
