@@ -72,6 +72,7 @@ The `[develop]` extras include:
 | Package | Purpose |
 |---------|---------|
 | `pytest`, `pytest-cov`, `pytest-randomly` | Running tests |
+| `hypothesis` | Property-based tests |
 | `mypy` + type stubs | Static type checking |
 | `ruff` | Linting, import sorting and code formatting |
 | `pre-commit` | Running Ruff automatically on `git commit` |
@@ -168,6 +169,18 @@ Use a branch name that combines the commit type, issue number, and a short descr
 | CI / build | `ci/102-update-workflow` |
 
 ### PR review and merge
+
+PyTest and Conda run on every PR (including drafts and forks) when it is opened,
+updated, reopened, or marked ready for review, and on pushes to `master`. Feature
+branch pushes use the PR checks to avoid duplicate runs. Contributions from forks
+may require maintainer approval before GitHub starts their workflows; resolve
+merge conflicts before expecting PR checks to run.
+
+Docker images are built and published to GHCR only for published releases, never
+for PRs or ordinary branch pushes. The Release workflow calls the Docker workflow
+after release-please creates a release; manually published releases trigger it
+directly. Stable semantic versions receive the `latest` image tag automatically;
+prereleases do not.
 
 1. Push your branch and open a Pull Request targeting `master`.
 2. In the PR description, include what changed, the related issue (`Closes #XXX`), and how to test it.
@@ -349,6 +362,28 @@ def test_zeros(dim: int, n_values: int, degree: int) -> None:
     assert bs.degree == (degree,)
 ```
 
+### Property-based tests of numerical code
+
+Hand-picked examples rarely include the inputs on which numerical code breaks. Code that computes with floating-point numbers (kernels, geometry, splitting, interpolation, …) must also be tested with [Hypothesis](https://hypothesis.readthedocs.io/) properties: invariants that hold for every valid input, checked on generated ones.
+
+- **What to state**: invariances (translation and scaling of coordinates, scaling of coefficients or data), identities (a map and its inverse, a child model and its parent), bounds (range preservation, partition of unity, nonnegativity), continuity across shared faces, and that invalid input (NaN, infinity, empty, wrong type or shape) raises the documented exception.
+- **Which inputs**: use the shared strategies of `tests/strategies.py`, which generate extreme values on purpose: translations up to `1e12`, scalings from `1e-6` to `1e6`, powers of two up to `2**±1000` (near the float64 limits), split ratios within `1e-12` of 0 and 1, and points on vertices and faces or with coordinates down to the smallest normal float64. Add a strategy there rather than in a test file, so that later properties can reuse it.
+- **Tolerances**: never use the default tolerance of `torch.testing.assert_close` or an arbitrary `1e-6`. Derive the bound from the unit roundoff `U = 2**-53` (the number of roundings, the condition number of the problem, the magnitude of the data), and write the derivation next to the test, as in `_split_tolerance` of `tests/splitting.py`. An exact operation (a translation or a power-of-two scaling whose results are representable) should give an exactly equal result.
+- **Counterexamples**: when a property fails, keep the shrunk input as a regression test (`@example` or a plain test) next to the property. Fix small bugs in the same PR. For a larger one, open an issue and mark the property `@pytest.mark.xfail(strict=True, reason="#<issue>")`.
+
+The Hypothesis profile is chosen with the `HYPOTHESIS_PROFILE` environment variable (see `tests/conftest.py`):
+
+| Profile | Use |
+|---------|-----|
+| `ci` (default) | Few examples, derandomized: every run tests the same inputs, so CI is reproducible and fast |
+| `thorough` | 2000 random examples per property, for hunting bugs locally; failures are saved in `.hypothesis/` and replayed first |
+
+```bash
+HYPOTHESIS_PROFILE=thorough pytest tests/splitting.py tests/interpolation.py -p no:randomly
+```
+
+Run the `thorough` profile on the properties you add or whose code you change before opening a PR.
+
 ### Docstring tests
 
 Write runnable examples in docstrings for all public APIs. They are verified automatically in CI:
@@ -437,6 +472,8 @@ pytorch-bsf/
 │   ├── __init__.py
 │   ├── simploidal.py                 # Unit tests for torch_bsf.simploidal
 │   ├── validator.py                  # Unit tests for Validator
+│   ├── conftest.py                   # Shared fixtures and the Hypothesis profiles
+│   ├── strategies.py                 # Hypothesis strategies shared by the property-based tests
 │   ├── …                             # One file per module (see Naming conventions)
 │   └── data/                         # Test data files
 ├── docs/                             # Sphinx documentation
