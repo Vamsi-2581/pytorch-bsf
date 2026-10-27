@@ -305,8 +305,6 @@ def test_locate_vertices_and_edge_midpoints_on_extreme_aspect_ratio(exponent):
     torch.testing.assert_close(found.parameters, expected, atol=1e-12, rtol=0)
 
 
-
-
 def test_locate_tolerance_and_outside_points():
     mesh = SimplicialMesh([[0.0], [1.0], [2.0]], [[0, 1], [1, 2]])
     found = mesh.locate(torch.tensor([[-1e-10], [2.0 + 1e-10]]))
