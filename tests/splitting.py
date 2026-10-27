@@ -1,12 +1,31 @@
 """Tests for torch_bsf._kernels._splitting."""
 
+from fractions import Fraction
 from typing import Literal
 
 import pytest
 import torch
+from hypothesis import given
+from hypothesis import strategies as st
 
+from tests.strategies import (
+    FLOAT64_TINY,
+    U,
+    degrees,
+    extreme_scalings,
+    factor_edges,
+    log_uniform,
+    matrices,
+    scalings,
+    simploid_points,
+    simploid_types,
+    split_fractions,
+)
+from torch_bsf import BezierModel, BezierSpace, Points
 from torch_bsf._kernels._splitting import longest_edge_criterion, max_error_criterion, reparametrize, split, split_by_criterion
 from torch_bsf._kernels.api import BezierSimploid
+from torch_bsf._kernels.combinatorics import _indices
+from torch_bsf.splitting import EdgeSplit, ParameterMap, subdivide, subdivide_space
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -854,3 +873,176 @@ def test_transfer_keeps_points_on_their_device():
     cpu = Points(moved.parameters.cpu(), moved.cell_ids.cpu())
     original = Points(points.parameters.cpu(), points.cell_ids.cpu())
     torch.testing.assert_close(result.model(cpu.to()), model(original.to()), rtol=0, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Properties (Hypothesis)
+# ---------------------------------------------------------------------------
+
+
+def _split_tolerance(simploid_type: tuple[int, ...], degree: tuple[int, ...], factor: int, magnitude: float) -> float:
+    r"""Bound on ``|child(u) - parent(to_parent(u))|`` for float64 coefficients of magnitude at most ``magnitude``.
+
+    With the unit roundoff :math:`u`, :math:`N` controls, total degree :math:`D = \sum_k d_k`, :math:`w` barycentric
+    coordinates and the degree :math:`n` of the split factor:
+
+    * each de Casteljau step is a convex combination ``s a + (1 - s) b``, which errs by at most :math:`3u` times the
+      largest control, and convex combinations do not amplify earlier errors: :math:`3nu` after :math:`n` steps;
+    * evaluating a model sums :math:`N` products of a control with a basis function, each basis function rounded
+      at most :math:`D + 2w` times: :math:`(N + D + 2w)u` relative to the largest control, once for each side;
+    * ``to_parent`` moves the parent coordinates by at most :math:`3u`, and the partial derivatives of a
+      Bézier simploid with respect to its coordinates are at most :math:`D` times the largest control: :math:`3Du`.
+
+    The sum is doubled, as the bounds of each rounding are not tight.
+    """
+    n_controls = len(_indices(simploid_type, degree))
+    width = sum(a + 1 for a in simploid_type)
+    total = sum(degree)
+    return 2 * (3 * degree[factor] + 2 * (n_controls + total + 2 * width) + 3 * total) * U * magnitude
+
+
+@given(data=st.data())
+def test_children_reproduce_the_parent_through_to_parent(data):
+    """For any edge and split ratio, each child equals the parent at the parent point of every child point."""
+    simploid_type = data.draw(simploid_types())
+    degree = data.draw(degrees(simploid_type))
+    factor, i, j = data.draw(factor_edges(simploid_type))
+    s = data.draw(split_fractions(), label="s")
+    space = BezierSpace.simploid(simploid_type, degree=degree)
+    coefficients = data.draw(matrices(space.n_controls, 2, scale=scalings() | extreme_scalings()), label="coefficients")
+    model = BezierModel(space, coefficients)
+    result = subdivide(model, policy=EdgeSplit(i, j, s, factor))
+    u = data.draw(simploid_points(simploid_type, 6), label="u")
+    tol = _split_tolerance(simploid_type, degree, factor, float(coefficients.abs().max()))
+    with torch.no_grad():
+        for child, mapping in zip(result.models, result.maps, strict=True):
+            assert child.coefficients.dtype == torch.float64
+            difference = (child(u) - model(mapping.to_parent(u))).abs().max()
+            assert difference <= tol, (mapping.part, float(difference), tol)
+
+
+@given(data=st.data())
+def test_from_parent_inverts_to_parent(data):
+    """``from_parent`` recovers child points from their parent points, except within rounding of the cut."""
+    simploid_type = data.draw(simploid_types())
+    factor, i, j = data.draw(factor_edges(simploid_type))
+    s = data.draw(split_fractions(), label="s")
+    u = data.draw(simploid_points(simploid_type, 6), label="u")
+    offset = sum(a + 1 for a in simploid_type[:factor])
+    parts: tuple[tuple[Literal["A", "B"], int], ...] = (("A", offset + i), ("B", offset + j))
+    for part, cut in parts:
+        mapping = ParameterMap(0, simploid_type, EdgeSplit(i, j, s, factor), part)
+        back, mask = mapping.from_parent(mapping.to_parent(u))
+        # The child coordinates are at most one; each is recovered by a few roundings of terms below one in
+        # magnitude, e.g. u_i = t_i - (1 - s) / s * t_j with t_j = s u_j for part A: 16 u bounds them.
+        torch.testing.assert_close(back.parameters, u[mask], atol=16 * U, rtol=0)
+        # A point is lost only if it lies on the cut face (u_i = 0 for A, u_j = 0 for B) up to rounding.
+        assert (u[~mask, cut] <= 4 * U).all()
+
+
+@given(data=st.data())
+def test_children_cover_the_parent_and_to_parent_inverts_from_parent(data):
+    """Every parent point lies in a child, and mapping it there and back returns it."""
+    simploid_type = data.draw(simploid_types())
+    factor, i, j = data.draw(factor_edges(simploid_type))
+    s = data.draw(split_fractions(), label="s")
+    t = Points(data.draw(simploid_points(simploid_type, 6), label="t"))
+    masks = []
+    for part in ("A", "B"):
+        mapping = ParameterMap(0, simploid_type, EdgeSplit(i, j, s, factor), part)
+        child, mask = mapping.from_parent(t)
+        # The child coordinates are valid barycentric coordinates (to_parent validates them) and map back to within
+        # a few roundings of numbers at most one; see test_from_parent_inverts_to_parent.
+        torch.testing.assert_close(mapping.to_parent(child).parameters, t.parameters[mask], atol=16 * U, rtol=0)
+        masks.append(mask)
+    assert (masks[0] | masks[1]).all()
+
+
+@given(
+    data=st.data(),
+    bad=st.sampled_from([float("nan"), float("inf"), -float("inf")]),
+)
+def test_to_parent_rejects_non_finite_points(data, bad):
+    simploid_type = data.draw(simploid_types())
+    factor, i, j = data.draw(factor_edges(simploid_type))
+    u = data.draw(simploid_points(simploid_type, 3))
+    u[data.draw(st.integers(0, 2)), data.draw(st.integers(0, u.shape[1] - 1))] = bad
+    with pytest.raises(ValueError, match="finite"):
+        ParameterMap(0, simploid_type, EdgeSplit(i, j, 0.5, factor), "A").to_parent(u)
+
+
+@pytest.mark.parametrize("part", ["A", "B"])
+def test_reparametrize_point_next_to_the_cut_of_a_thin_piece(part: Literal["A", "B"]):
+    """Regression test for a counterexample of the properties above: t_i = 1e-12, t_j ~ 1 and s = 1 - 1e-12.
+
+    The point lies within rounding of the cut. Testing t_j <= s (t_i + t_j) lost t_i and put the point in piece B,
+    where it got u_j = -2.2e-5, so that ``to_parent`` rejected it.
+    """
+    t = torch.tensor([[1.0, 0.0, 1e-12]], dtype=torch.float64)
+    t = t / t.sum(dim=1, keepdim=True)
+    u, mask = reparametrize(t, 2, 0, 0.999999999999, part)
+    assert (u[mask] >= -4 * U).all()
+
+
+# Edge coordinates down to the smallest subnormal float64, and zero.
+_edge_coordinates = st.one_of(st.just(0.0), log_uniform(5e-324, 1.0))
+
+
+@given(t_i=_edge_coordinates, t_j=_edge_coordinates, s=split_fractions(FLOAT64_TINY) | st.sampled_from([1 - U, 5e-324]))
+def test_reparametrize_puts_each_point_in_the_piece_of_its_exact_ratio(t_i: float, t_j: float, s: float):
+    """A point is in piece A iff t_j / (t_i + t_j) <= s, and in B iff it is >= s, decided on exact rationals.
+
+    The only rounding is that of 1 - s, a relative error of at most U, so ratios within U max(s, 1 - s) of s may
+    go either way; every other point must be in exactly the piece of its exact ratio, however small its coordinates.
+    """
+    t = torch.tensor([[t_i, t_j, max(0.0, 1.0 - t_i - t_j)]], dtype=torch.float64)
+    _, in_a = reparametrize(t, 0, 1, s, "A")
+    _, in_b = reparametrize(t, 0, 1, s, "B")
+    assert bool(in_a) or bool(in_b)
+    if t_i + t_j == 0:
+        assert bool(in_a) and bool(in_b)
+        return
+    ratio, cut = Fraction(t_j) / (Fraction(t_i) + Fraction(t_j)), Fraction(s)
+    if abs(ratio - cut) > Fraction(U) * max(cut, 1 - cut):
+        assert bool(in_a) == (ratio < cut)
+        assert bool(in_b) == (ratio > cut)
+
+
+def test_reparametrize_point_with_an_underflowing_product():
+    """Regression test: for t = [0, DBL_MIN, 1] and s = nextafter(1, 0), (1 - s) t_j and s t_i both underflowed
+    to 0, so the point, whose ratio t_j / (t_i + t_j) is 1, was also put in piece A.
+    """
+    t = torch.tensor([[0.0, FLOAT64_TINY, 1.0]], dtype=torch.float64)
+    _, in_a = reparametrize(t, 0, 1, 1 - U, "A")
+    _, in_b = reparametrize(t, 0, 1, 1 - U, "B")
+    assert not bool(in_a)
+    assert bool(in_b)
+
+
+@given(data=st.data())
+def test_subdivide_space_keeps_the_function_at_any_fraction(data):
+    """Refining a whole space at any fraction, including within 1e-12 of an end, keeps the value at every point.
+
+    The tolerance is that of :func:`_split_tolerance` for the largest cell type of the domain: the refined
+    controls come from the same de Casteljau steps, and ``transfer`` maps a point to the coordinates of its
+    piece with the same few roundings as ``to_parent``.
+    """
+    name = data.draw(st.sampled_from(sorted(_domains())), label="domain")
+    space = BezierSpace.on_set(_domains()[name], degree=2)
+    coefficients = data.draw(matrices(space.n_controls, 2, scale=scalings() | extreme_scalings()), label="coefficients")
+    model = BezierModel(space, coefficients)
+    cid = data.draw(st.integers(0, space.n_cells - 1), label="cell")
+    dimensions = space.cells[cid].dimensions
+    if not dimensions:
+        return
+    factor, i, j = data.draw(factor_edges(dimensions), label="edge")
+    s = data.draw(split_fractions(), label="s")
+    result = subdivide_space(model, cell=cid, policy=EdgeSplit(i, j, s, factor))
+    cells = [k for k, cell in enumerate(space.cells) if cell.dimensions]
+    pairs = [(k, data.draw(simploid_points(space.cells[k].dimensions, 3), label=f"points of cell {k}")) for k in cells]
+    points = Points.from_cells(space, pairs)
+    magnitude = coefficients.abs().max().item()
+    tolerance = max(
+        _split_tolerance(cell.dimensions, (2,) * len(cell.dimensions), 0, magnitude) for cell in space.cells if cell.dimensions
+    )
+    torch.testing.assert_close(result.model(result.transfer(points)), model(points), rtol=0, atol=tolerance)

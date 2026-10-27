@@ -61,6 +61,47 @@ def _simplicial_set(simplices: Sequence[Sequence[int]]) -> tuple[SimploidalSet, 
     return domain, tops
 
 
+def _times_power_of_two(x: torch.Tensor, exponent: torch.Tensor) -> torch.Tensor:
+    """``x * 2**exponent`` for integer ``exponent`` of any size, rounded once, even where ``2**exponent`` is not a float64.
+
+    The power is applied in three factors of the same sign, each at most ``2**767``, so the intermediate products
+    move monotonically towards the result and only the result can overflow or underflow. Beyond ``2**+-2300``,
+    every nonzero float64 ``x`` gives ``inf`` or ``0`` anyway.
+    """
+    e = exponent.to(torch.float64).clamp(-2300, 2300)
+    first = torch.trunc(e / 3)
+    second = torch.trunc((e - first) / 2)
+    two = torch.tensor(2.0, dtype=torch.float64)
+    return x * torch.pow(two, first) * torch.pow(two, second) * torch.pow(two, e - first - second)
+
+
+def _equilibrate(
+    mantissa: torch.Tensor, exponent: torch.Tensor, axis_exponent: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split edges ``mantissa * 2**exponent`` of shape ``(m, d, d)`` as ``diag(2**edge) @ unit @ diag(2**axis)``.
+
+    Each edge (row) of ``unit`` has its largest entry in ``[1, 2)``, after the axes (columns) are divided by
+    ``2**axis_exponent``. The exponents are integers, so no entry underflows on the way and each entry of ``unit``
+    is its edge entry times a power of two. A common power of two moves from the edges to the axes so that the edge
+    exponents are centred on zero, because they multiply the barycentric coordinates in
+    :meth:`SimplicialMesh.barycentric`.
+
+    Returns ``(unit, edge_exponent, axis_exponent, ok, det)``: ``ok`` tells whether the volume of ``unit`` exceeds
+    ``1e-12`` times the product of its edge lengths, and ``det`` is its determinant.
+    """
+    shift = exponent - axis_exponent[:, None, :]
+    edge_exponent = shift.amax(dim=2) - 1  # (m, d)
+    unit = torch.where(mantissa == 0, 0.0, _times_power_of_two(mantissa, shift - edge_exponent[:, :, None]))
+    centre = torch.div(edge_exponent.amax(dim=1) + edge_exponent.amin(dim=1), 2, rounding_mode="floor")[:, None]
+    # The determinant from the LU factors: torch.linalg.det was seen to be off by tens of ulps even for a triangular
+    # matrix, whose LU factorization is exact.
+    lu, pivots, _ = torch.linalg.lu_factor_ex(unit)
+    swaps = (pivots != torch.arange(1, unit.shape[-1] + 1, dtype=pivots.dtype)).sum(dim=-1)
+    det = torch.where(swaps % 2 == 1, -1.0, 1.0) * lu.diagonal(dim1=-2, dim2=-1).prod(dim=-1)
+    ok = det.abs() > 1e-12 * unit.norm(dim=2).prod(dim=1)
+    return unit, edge_exponent - centre, axis_exponent + centre, ok, det
+
+
 def _as_real_tensor(x: Any) -> torch.Tensor:
     """Read ``x`` as a tensor, parsing non-tensor floating-point input in float64 rather than the default dtype."""
     t = torch.as_tensor(x)
@@ -78,7 +119,10 @@ class SimplicialMesh:
         Vertex coordinates of shape ``(n_vertices, d)``, ``d >= 1``.
     simplices
         Vertex numbers of shape ``(n_simplices, d + 1)``. The simplices must be non-degenerate and meet
-        face to face (as in a Delaunay triangulation); the mesh is not generated here.
+        face to face (as in a Delaunay triangulation); the mesh is not generated here. A simplex counts as
+        degenerate when its volume is at most ``1e-12`` times the product of its edge lengths both in the given
+        coordinates and with each axis divided by the extent of the simplex along it (rounded down to a power
+        of two), so that neither the units of the axes nor the scale of the coordinates matters.
 
     Attributes
     ----------
@@ -126,15 +170,34 @@ class SimplicialMesh:
             raise ValueError("a simplex repeats a vertex.")
         if len(torch.unique(s, dim=0)) != len(s):
             raise ValueError("simplices must be distinct.")
-        edges = x[s[:, 1:]] - x[s[:, :1]]  # (m, d, d)
-        det = torch.linalg.det(edges)
-        scale = edges.norm(dim=2).prod(dim=1)
-        if (det.abs() <= 1e-12 * scale).any():
+        edges = x[s[:, 1:]] - x[s[:, :1]]  # (m, d, d): row k is the edge from vertex 0 to vertex k + 1
+        if not torch.isfinite(edges).all():
+            raise ValueError("the vertices of a simplex are too far apart: their differences overflow float64.")
+        # The edges are E = diag(2**edge_exponent) @ unit @ diag(2**axis_exponent), with the largest entry of
+        # every edge of `unit` in [1, 2). The determinant, the edge lengths and the inverse of E itself overflow or
+        # underflow for coordinates beyond about 1e+-150, or for axes or edges of very different lengths; those of
+        # `unit` do not. Two choices of axis exponents are tried: one per axis, from the extent of the simplex
+        # along it, under which scaling an axis by a power of two changes only its exponent; and a common one,
+        # which keeps the Euclidean shape. The first is used unless only the second gives a non-degenerate `unit`.
+        mantissa, exponent = torch.frexp(edges)
+        exponent = torch.where(mantissa == 0, -(2**20), exponent.to(torch.long))  # zeros never set a scale
+        per_axis = _equilibrate(mantissa, exponent, exponent.amax(dim=1))
+        common = _equilibrate(mantissa, exponent, torch.zeros_like(exponent[:, 0]))
+        use_common = (~per_axis[3]) & common[3]
+        if not (per_axis[3] | common[3]).all():
             raise ValueError("a simplex is degenerate (zero volume).")
+        unit, self._edge_exponent, self._axis_exponent, _, det = (
+            torch.where(use_common.view((-1,) + (1,) * (a.ndim - 1)), b, a) for a, b in zip(per_axis, common, strict=True)
+        )
         self.vertices = x
         self.simplices = s
-        self._inverse = torch.linalg.inv(edges.transpose(1, 2))  # maps x - x_0 to barycentric coordinates 1..d
-        self._volumes: torch.Tensor = det.abs() / factorial(d)
+        # Maps (x - x_0) / 2**axis_exponent to barycentric coordinates 1..d times 2**edge_exponent.
+        self._inverse = torch.linalg.inv(unit.transpose(1, 2))
+        # Volumes are kept as mantissa * 2**exponent too, so that a product with a volume beyond the float64 range
+        # (e.g. a refinement score) can still be finite.
+        self._volume_mantissa = det.abs() / factorial(d)
+        self._volume_exponent = self._edge_exponent.sum(dim=1) + self._axis_exponent.sum(dim=1)
+        self._volumes: torch.Tensor = _times_power_of_two(self._volume_mantissa, self._volume_exponent)
         domain, tops = _simplicial_set(s.tolist())
         self.space = BezierSpace.on_set(domain, degree=_DEGREE)
         self.cell_ids = torch.tensor([self.space.cell_id(t) for t in tops], dtype=torch.long)
@@ -186,7 +249,8 @@ class SimplicialMesh:
         """
         p = self._check_points(x)
         origin = self.vertices[self.simplices[:, 0]]  # (m, d)
-        rest = torch.einsum("mij,nmj->nmi", self._inverse, p[:, None, :] - origin[None])
+        offset = _times_power_of_two(p[:, None, :] - origin[None], -self._axis_exponent[None])
+        rest = _times_power_of_two(torch.einsum("mij,nmj->nmi", self._inverse, offset), -self._edge_exponent[None])
         return torch.cat([1 - rest.sum(dim=2, keepdim=True), rest], dim=2)
 
     def locate(self, x: Any, *, tol: float = 1e-8, batch_size: int = 1024) -> Points:
@@ -220,8 +284,9 @@ class SimplicialMesh:
         ids, coordinates = [], []
         for chunk in torch.split(p, max(1, batch_size)):
             lam = self.barycentric(chunk)
-            margin, best = lam.min(dim=2).values.max(dim=1)
-            if (margin < -tol).any():
+            # Coordinates that overflow (NaN or inf) belong to a simplex far from the point.
+            margin, best = torch.nan_to_num(lam.min(dim=2).values, nan=-torch.inf).max(dim=1)
+            if not (margin >= -tol).all():
                 raise ValueError("a point lies outside the mesh.")
             t = lam[torch.arange(len(chunk)), best].clamp_min(0)
             coordinates.append(t / t.sum(dim=1, keepdim=True))
@@ -254,28 +319,52 @@ def _gradient_at(v: int, x: torch.Tensor, f: torch.Tensor, ring: list[list[int]]
         near.discard(v)
         if len(near) >= n_quadratic + 2:
             break
-    if len(near) >= n_quadratic + 2:
-        rows = torch.tensor(sorted(near), dtype=torch.long)
-        offsets = x[rows] - x[v]
-        design = torch.cat([offsets, offsets[:, iu[0]] * offsets[:, iu[1]]], dim=1)
-    else:  # The one-ring of a vertex of a non-degenerate simplex spans R^d.
-        rows = torch.tensor(ring[v], dtype=torch.long)
-        offsets = x[rows] - x[v]
-        design = offsets
-    weight = offsets.square().sum(dim=1).clamp_min(1e-300).rsqrt()[:, None]  # square root of 1 / |x_w - x_v|^2
-    solution: torch.Tensor = torch.linalg.lstsq(design * weight, (f[rows] - f[v]) * weight, driver="gelsd").solution
-    return solution[:d]
+    quadratic = len(near) >= n_quadratic + 2
+    # The one-ring of a vertex of a non-degenerate simplex spans R^d, for the linear fallback.
+    rows = torch.tensor(sorted(near) if quadratic else ring[v], dtype=torch.long)
+    offsets = x[rows] - x[v]
+    # The fit is solved in the coordinates q = H^{-1} offsets, H = diag(extent of each axis), with the rows
+    # weighted by 1 / |q|: each weighted linear row is the unit vector q / |q| and its right-hand side the slope
+    # (f_w - f_v) / |q|. They are computed from the mantissas and exponents of the offsets, so that nothing
+    # overflows or underflows on the way however the axes and the neighbours differ in scale.
+    mantissa, exponent = torch.frexp(offsets)
+    extent_mantissa, extent_exponent = torch.frexp(offsets.abs().amax(dim=0))  # H_j = extent_mantissa_j * 2**...
+    exponent = torch.where(mantissa == 0, -(2**20), exponent.to(torch.long) - extent_exponent.to(torch.long))
+    row_exponent = exponent.amax(dim=1, keepdim=True)  # q_k = 2**row_exponent_k * p_k, at most 0
+    p = torch.where(mantissa == 0, 0.0, _times_power_of_two(mantissa / extent_mantissa, exponent - row_exponent))
+    length = p.norm(dim=1, keepdim=True)  # in [1/2, 2 sqrt(d)]
+    unit = p / length
+    if quadratic:
+        q = _times_power_of_two(p, row_exponent)  # entries of q are at most 1 in magnitude
+        design = torch.cat([unit, unit[:, iu[0]] * q[:, iu[1]]], dim=1)
+    else:
+        design = unit
+    # Slopes as mantissa * 2**exponent, scaled by one power of two per output so that the largest is near one.
+    slope_mantissa, slope_exponent = torch.frexp(f[rows] - f[v])
+    slope_mantissa = slope_mantissa / length
+    slope_exponent = torch.where(slope_mantissa == 0, -(2**20), slope_exponent.to(torch.long) - row_exponent)
+    top = slope_exponent.amax(dim=0)  # (n_outputs,)
+    top = torch.where(top < -(2**19), 0, top)  # data constant on the neighbourhood
+    rhs = _times_power_of_two(slope_mantissa, slope_exponent - top)
+    solution: torch.Tensor = torch.linalg.lstsq(design, rhs, driver="gelsd").solution
+    # The linear coefficients are the gradient times H, divided by 2**top.
+    shift = top[None, :] - extent_exponent.to(torch.long)[:, None]
+    return _times_power_of_two(solution[:d] / extent_mantissa[:, None], shift)
 
 
 def estimate_gradients(mesh: SimplicialMesh, values: Any, *, max_rings: int = 4) -> torch.Tensor:
     r"""Estimate the gradient of vertex data at every vertex from its mesh neighbours.
 
     At each vertex, a quadratic polynomial is fitted by least squares with weights
-    :math:`1 / |x_w - x_v|^2` to the data on the smallest :math:`k`-ring neighbourhood
+    :math:`1 / |H^{-1}(x_w - x_v)|^2` to the data on the smallest :math:`k`-ring neighbourhood
     (:math:`2 \le k \le` ``max_rings``) that contains at least two more points than the quadratic has
     unknowns. If no such neighbourhood exists, a linear polynomial is fitted on the one-ring instead.
     The quadratic fit reproduces the gradient of quadratic data exactly, and either fit reproduces that
     of linear data. Vertices that belong to no simplex get a zero gradient.
+
+    :math:`H` is the diagonal matrix of the largest :math:`|x_w - x_v|` along each axis over the
+    neighbourhood, so that the estimate does not depend on the units of the axes: scaling an axis by
+    :math:`c` divides that component of the gradient by :math:`c`, even for axes of very different scales.
 
     Parameters
     ----------
@@ -435,4 +524,12 @@ def refinement_indicator(mesh: SimplicialMesh, values: Any, *, gradients: Any = 
     with torch.no_grad():
         cubic: torch.Tensor = model(centroid)
     linear = f[mesh.simplices].mean(dim=1)
-    return (cubic - linear).abs().mean(dim=1) * mesh.volumes()
+    correction = (cubic - linear).abs().mean(dim=1)
+    # Multiplied by the volume as mantissa * 2**exponent, with the correction split the same way: a volume beyond
+    # the float64 range may still give a finite score, a tiny correction is not lost before the exponent scales it
+    # up, and a simplex without correction scores zero rather than 0 * inf = NaN.
+    correction_mantissa, correction_exponent = torch.frexp(correction)
+    score = _times_power_of_two(
+        correction_mantissa * mesh._volume_mantissa, correction_exponent.to(torch.long) + mesh._volume_exponent
+    )
+    return torch.where(correction > 0, score, 0.0)
