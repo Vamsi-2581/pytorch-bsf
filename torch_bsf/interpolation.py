@@ -133,7 +133,16 @@ class SimplicialMesh:
             raise ValueError("a simplex is degenerate (zero volume).")
         self.vertices = x
         self.simplices = s
-        self._inverse = torch.linalg.inv(edges.transpose(1, 2))  # maps x - x_0 to barycentric coordinates 1..d
+        simplex_vertices = x[s]
+        self._other_indices = torch.tensor(
+            [[j for j in range(d + 1) if j != anchor] for anchor in range(d + 1)], dtype=torch.long
+        )
+        inverses = []
+        for anchor in range(d + 1):
+            other = self._other_indices[anchor]
+            anchor_edges = simplex_vertices[:, other] - simplex_vertices[:, anchor : anchor + 1]
+            inverses.append(torch.linalg.inv(anchor_edges.transpose(1, 2)))
+        self._inverse_by_anchor = torch.stack(inverses, dim=1)
         self._volumes: torch.Tensor = det.abs() / factorial(d)
         domain, tops = _simplicial_set(s.tolist())
         self.space = BezierSpace.on_set(domain, degree=_DEGREE)
@@ -185,9 +194,24 @@ class SimplicialMesh:
             They sum to one and are all nonnegative exactly when the point lies in the simplex.
         """
         p = self._check_points(x)
-        origin = self.vertices[self.simplices[:, 0]]  # (m, d)
-        rest = torch.einsum("mij,nmj->nmi", self._inverse, p[:, None, :] - origin[None])
-        return torch.cat([1 - rest.sum(dim=2, keepdim=True), rest], dim=2)
+        simplex_vertices = self.vertices[self.simplices]
+        best_distance = torch.full((len(p), self.n_simplices), float("inf"), dtype=torch.float64)
+        coordinates = torch.empty((len(p), self.n_simplices, self.dimension + 1), dtype=torch.float64)
+        for anchor in range(self.dimension + 1):
+            origin = simplex_vertices[:, anchor]
+            distance = torch.linalg.vector_norm(p[:, None, :] - origin[None, :, :], dim=2)
+            rest = torch.einsum(
+                "mij,nmj->nmi",
+                self._inverse_by_anchor[:, anchor],
+                p[:, None, :] - origin[None, :, :],
+            )
+            candidate = torch.zeros_like(coordinates)
+            candidate[:, :, self._other_indices[anchor]] = rest
+            candidate[:, :, anchor] = 1 - rest.sum(dim=2)
+            better = distance < best_distance
+            coordinates = torch.where(better[:, :, None], candidate, coordinates)
+            best_distance = torch.where(better, distance, best_distance)
+        return coordinates
 
     def locate(self, x: Any, *, tol: float = 1e-8, batch_size: int = 1024) -> Points:
         """Find the simplex containing each point and its barycentric coordinates there.
@@ -204,7 +228,7 @@ class SimplicialMesh:
             coordinates are clipped to be nonnegative and renormalized, which moves points just outside the
             mesh onto its boundary.
         batch_size
-            Number of points tested at a time, which bounds the memory to ``batch_size * n_simplices * (d + 1)``.
+            Number of points tested at a time, which bounds temporary memory to ``O(batch_size * n_simplices * (d + 1))``.
 
         Returns
         -------
