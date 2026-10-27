@@ -209,6 +209,8 @@ class SimplicialMesh:
             candidate[:, :, self._other_indices[anchor]] = rest
             candidate[:, :, anchor] = 1 - rest.sum(dim=2)
             better = distance < best_distance
+            if anchor == 0:
+                better = torch.ones_like(best_distance, dtype=torch.bool)
             coordinates = torch.where(better[:, :, None], candidate, coordinates)
             best_distance = torch.where(better, distance, best_distance)
         return coordinates
