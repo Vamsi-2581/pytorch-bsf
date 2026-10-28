@@ -427,16 +427,22 @@ def test_exact_fallback_preserves_forward_mode_point_tangents(mode):
     torch.testing.assert_close(tangent, expected, rtol=0, atol=0)
 
 
-def test_exact_fallback_preserves_forward_mode_vertex_tangents():
-    short = 2.0**-100
+@pytest.mark.parametrize("mode", ["dual", "func"])
+@pytest.mark.parametrize("short", [1.0, 2.0**-100])
+def test_barycentric_preserves_forward_mode_vertex_tangents(mode, short):
     vertices = torch.tensor([[0.0, 0.0], [1.0, 1.0], [short, -short]], dtype=torch.float64)
-    direction = torch.tensor([[short, -short]] * 3, dtype=torch.float64)
-    with torch.autograd.forward_ad.dual_level():
-        dual = torch.autograd.forward_ad.make_dual(vertices, direction)
-        mesh = SimplicialMesh(dual, [[0, 1, 2]])
-        primal, tangent = torch.autograd.forward_ad.unpack_dual(mesh.barycentric([[0.5, 0.5]]))
+    direction = torch.tensor([[0.0, 0.0], [short, -short], [0.0, 0.0]], dtype=torch.float64)
+    if mode == "dual":
+        with torch.autograd.forward_ad.dual_level():
+            dual = torch.autograd.forward_ad.make_dual(vertices, direction)
+            mesh = SimplicialMesh(dual, [[0, 1, 2]])
+            primal, tangent = torch.autograd.forward_ad.unpack_dual(mesh.barycentric([[0.5, 0.5]]))
+    else:
+        primal, tangent = torch.func.jvp(
+            lambda v: SimplicialMesh(v, [[0, 1, 2]]).barycentric([[0.5, 0.5]]), (vertices,), (direction,)
+        )
     torch.testing.assert_close(primal, torch.tensor([[[0.5, 0.5, 0.0]]], dtype=torch.float64), rtol=0, atol=0)
-    torch.testing.assert_close(tangent, torch.tensor([[[1.0, 0.0, -1.0]]], dtype=torch.float64), rtol=0, atol=0)
+    torch.testing.assert_close(tangent, torch.tensor([[[0.5, 0.0, -0.5]]], dtype=torch.float64), rtol=0, atol=0)
 
 
 def test_exact_forward_mode_cancels_before_rounding_and_retains_reverse_gradients():

@@ -84,11 +84,14 @@ class _Frexp(torch.autograd.Function):
     """Differentiate frexp without materializing an infinite scale factor for subnormal inputs."""
 
     @staticmethod
-    def forward(ctx: Any, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        mantissa, exponent = torch.frexp(value)
+    def forward(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.frexp(value)
+
+    @staticmethod
+    def setup_context(ctx: Any, inputs: tuple[torch.Tensor], output: tuple[torch.Tensor, torch.Tensor]) -> None:
+        _, exponent = output
         ctx.save_for_backward(exponent)
         ctx.save_for_forward(exponent)
-        return mantissa, exponent
 
     @staticmethod
     def backward(ctx: Any, gradient: torch.Tensor, exponent_gradient: None) -> torch.Tensor:
