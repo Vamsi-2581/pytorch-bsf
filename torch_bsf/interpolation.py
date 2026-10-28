@@ -249,7 +249,7 @@ def _rational_inverse(vertices: torch.Tensor) -> tuple[list[Fraction], list[list
     Used lazily for point/simplex pairs whose floating-point solve suffers large cancellation. An exact
     inverse is shared by all such points; no inverse about a distant, numerically singular anchor is needed.
     """
-    points = [[Fraction(v) for v in row] for row in vertices.tolist()]
+    points = [[Fraction(float(v.detach())) for v in row.unbind()] for row in vertices.unbind()]
     origin, d = points[0], vertices.shape[1]
     rows = [[points[j + 1][i] - origin[i] for j in range(d)] + [Fraction(i == j) for j in range(d)] for i in range(d)]
     for column in range(d):
@@ -490,6 +490,9 @@ class SimplicialMesh:
         )
         self.vertices = x
         self.simplices = s
+        # Keep discrete topology in Python too: older functorch versions cannot expose wrapped
+        # tensor storage through tolist(), even for constant integer metadata.
+        self._simplex_rows = [tuple(int(v) for v in row.unbind()) for row in s.unbind()]
         # Maps (x - x_0) / 2**axis_exponent to barycentric coordinates 1..d times 2**edge_exponent.
         self._inverse = torch.linalg.inv(unit.transpose(1, 2))
         # The final dot-product error alone misses rounding in the factorization of a nearly singular
@@ -516,7 +519,7 @@ class SimplicialMesh:
             if strict:
                 raise ValueError(message)
             warnings.warn(message, stacklevel=2)
-        domain, tops = _simplicial_set(s.tolist())
+        domain, tops = _simplicial_set(self._simplex_rows)
         self.space = BezierSpace.on_set(domain, degree=_DEGREE)
         self.cell_ids = torch.tensor([self.space.cell_id(t) for t in tops], dtype=torch.long)
 
@@ -561,7 +564,7 @@ class SimplicialMesh:
     def _count_unmatched_faces(self) -> int:
         d = self.dimension
         owners: dict[tuple[int, ...], list[int]] = {}
-        for k, simplex in enumerate(self.simplices.tolist()):
+        for k, simplex in enumerate(self._simplex_rows):
             for i in range(d + 1):
                 owners.setdefault(tuple(simplex[:i] + simplex[i + 1 :]), []).append(k)
         crowded = sum(1 for o in owners.values() if len(o) > 2)
@@ -726,7 +729,8 @@ class SimplicialMesh:
             safe_offset = torch.where(uncertain[:, :, None], 0.0, offset)
             rest = _times_power_of_two(torch.einsum("mij,nmj->nmi", self._inverse, safe_offset), -self._edge_exponent[None])
             result = torch.cat([1 - rest.sum(dim=2, keepdim=True), rest], dim=2)
-        for cell in uncertain.any(dim=0).nonzero().flatten().tolist():
+        for cell_tensor in uncertain.any(dim=0).nonzero().flatten().unbind():
+            cell = int(cell_tensor)
             vertices = self.vertices[self.simplices[cell]]
             if cell not in self._exact_inverses:
                 self._exact_inverses[cell] = _rational_inverse(vertices)
@@ -740,7 +744,8 @@ class SimplicialMesh:
                     )
                 expressions, symbols = self._exact_formulas[key]
                 rows = []
-                for index in indices.tolist():
+                for index_tensor in indices.unbind():
+                    index = int(index_tensor)
                     arguments = (p[index], vertices) if vertices.requires_grad else (p[index],)
                     rows.append(_ExactExpressions.apply(expressions, symbols, (self.dimension + 1,), *arguments))
                 values = torch.stack(rows)
