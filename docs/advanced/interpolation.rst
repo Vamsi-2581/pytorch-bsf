@@ -110,6 +110,15 @@ supplied position cannot identify the intended midpoint. Use coordinates
 that resolve the feature of interest; increasing ``tol`` does not recover
 the missing information.
 
+The mesh keeps independent snapshots of the input vertices and simplices,
+including CPU float64 tensors and NumPy arrays. Changing those original
+inputs later does not change coordinates, point location, volumes or
+interpolation. Treat ``mesh.vertices`` and ``mesh.simplices`` as read-only:
+direct in-place edits are unsupported because cached geometry and the
+compiled space would become inconsistent. Construct a new mesh to change
+its geometry or topology. Copying tensor vertices preserves their autograd
+connection.
+
 How the cubic pieces are built
 ------------------------------
 
