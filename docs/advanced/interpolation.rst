@@ -100,6 +100,8 @@ path is slower than ordinary tensor differentiation. Forward-mode queries
 (``torch.autograd.forward_ad`` or ``torch.func.jvp``) with any affected pair
 evaluate the whole query using these expressions, preserving point and vertex
 tangents without exposing dual tensor storage to Python.
+``torch.func.jacrev`` and ``torch.func.jacfwd`` batch the exact evaluations
+independently, retaining their individual rational bindings.
 ``locate(batch_size=...)`` bounds temporary float64 storage by
 ``O(batch_size * n_simplices * (d + 1))``, in addition to that cache.
 

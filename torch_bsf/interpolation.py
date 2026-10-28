@@ -83,9 +83,12 @@ def _times_power_of_two(x: torch.Tensor, exponent: torch.Tensor) -> torch.Tensor
 class _Frexp(torch.autograd.Function):
     """Differentiate frexp without materializing an infinite scale factor for subnormal inputs."""
 
+    generate_vmap_rule = True
+
     @staticmethod
     def forward(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.frexp(value)
+        mantissa, exponent = torch.frexp(value)
+        return mantissa, exponent
 
     @staticmethod
     def setup_context(ctx: Any, inputs: tuple[torch.Tensor], output: tuple[torch.Tensor, torch.Tensor]) -> None:
@@ -305,6 +308,26 @@ class _ExactExpressions(torch.autograd.Function):
         ctx.expressions, ctx.symbols, ctx.shape, *arguments = inputs
         ctx.save_for_backward(*arguments)
         ctx.save_for_forward(*arguments)
+
+    @staticmethod
+    def vmap(
+        info: Any,
+        in_dims: tuple[Any, ...],
+        expressions: tuple[Any, ...],
+        symbols: tuple[tuple[Any, ...], ...],
+        shape: tuple[int, ...],
+        *arguments: torch.Tensor,
+    ) -> tuple[torch.Tensor, int]:
+        # SymPy reads concrete scalar bindings in forward. Iterate this transform's batch outside it,
+        # keeping independent exact evaluations rather than exposing batched tensor storage to Python.
+        rows = []
+        for index in range(info.batch_size):
+            values = tuple(
+                argument if axis is None else argument.select(axis, index)
+                for argument, axis in zip(arguments, in_dims[3:], strict=True)
+            )
+            rows.append(_ExactExpressions.apply(expressions, symbols, shape, *values))
+        return torch.stack(rows), 0
 
     @staticmethod
     def backward(ctx: Any, gradient: torch.Tensor) -> tuple[Any, ...]:

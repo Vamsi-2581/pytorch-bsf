@@ -496,6 +496,39 @@ def test_exact_forward_mode_cancels_before_rounding_and_retains_reverse_gradient
     torch.testing.assert_close(gradient, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("transform", [torch.func.jacrev, torch.func.jacfwd])
+@pytest.mark.parametrize("short", [1.0, 2.0**-100])
+@pytest.mark.parametrize("argument", ["points", "vertices"])
+def test_barycentric_batched_jacobian_transforms(transform, short, argument):
+    """Jacobian transforms batch pullbacks/pushforwards, including the exact-expression recursion."""
+    vertices = torch.tensor([[0.0, 0.0], [1.0, 1.0], [short, -short]], dtype=torch.float64)
+    point = torch.tensor([[0.5, 0.5]], dtype=torch.float64)
+    jacobian = torch.tensor(
+        [[-0.5 - 0.5 / short, -0.5 + 0.5 / short], [0.5, 0.5], [0.5 / short, -0.5 / short]], dtype=torch.float64
+    )
+    if argument == "points":
+        result = transform(SimplicialMesh(vertices, [[0, 1, 2]]).barycentric)(point)
+        expected = jacobian[None, None, :, None, :]
+    else:
+        result = transform(lambda v: SimplicialMesh(v, [[0, 1, 2]]).barycentric(point))(vertices)
+        weights = torch.tensor([0.5, 0.5, 0.0], dtype=torch.float64)
+        expected = (-jacobian[:, None, :] * weights[None, :, None])[None, None]
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+def test_exact_barycentric_hessian_composes_forward_reverse_and_batching():
+    short = 2.0**-100
+    vertices = torch.tensor([[0.0, 0.0], [1.0, 1.0], [short, -short]], dtype=torch.float64)
+
+    def coordinate(v):
+        return SimplicialMesh(v, [[0, 1, 2]]).barycentric([[0.5, 0.5]])[0, 0, 2]
+
+    actual = torch.func.hessian(coordinate)(vertices)
+    expected = torch.autograd.functional.hessian(coordinate, vertices)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual[1, 0, 1, 0].item() == 0.25 / short
+
+
 def test_exact_inverse_rejects_an_affinely_dependent_simplex():
     """The exact solver must reject a truly singular triangle instead of dividing by a zero pivot."""
     vertices = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float64)
