@@ -408,6 +408,54 @@ def test_cancellation_fallback_keeps_barycentric_point_gradients():
     torch.testing.assert_close(gradient, torch.tensor([[1 / (2 * short), -1 / (2 * short)]], dtype=torch.float64))
 
 
+@pytest.mark.parametrize("mode", ["dual", "func"])
+def test_exact_fallback_preserves_forward_mode_point_tangents(mode):
+    """Codex review: a dual need not require reverse gradients to carry a nonzero tangent."""
+    short = 2.0**-100
+    mesh = SimplicialMesh([[0.0, 0.0], [1.0, 1.0], [short, -short]], [[0, 1, 2]])
+    points = torch.tensor([[0.25, 0.25], [0.5, 0.5]], dtype=torch.float64)
+    direction = torch.tensor([[short, -short], [short, short]], dtype=torch.float64)
+    if mode == "dual":
+        with torch.autograd.forward_ad.dual_level():
+            dual = torch.autograd.forward_ad.make_dual(points, direction)
+            primal, tangent = torch.autograd.forward_ad.unpack_dual(mesh.barycentric(dual))
+    else:
+        primal, tangent = torch.func.jvp(mesh.barycentric, (points,), (direction,))
+    torch.testing.assert_close(primal, mesh.barycentric(points), rtol=0, atol=0)
+    expected = torch.tensor([[[-1.0, 0.0, 1.0]], [[-short, short, 0.0]]], dtype=torch.float64)
+    assert tangent is not None
+    torch.testing.assert_close(tangent, expected, rtol=0, atol=0)
+
+
+def test_exact_fallback_preserves_forward_mode_vertex_tangents():
+    short = 2.0**-100
+    vertices = torch.tensor([[0.0, 0.0], [1.0, 1.0], [short, -short]], dtype=torch.float64)
+    direction = torch.tensor([[short, -short]] * 3, dtype=torch.float64)
+    with torch.autograd.forward_ad.dual_level():
+        dual = torch.autograd.forward_ad.make_dual(vertices, direction)
+        mesh = SimplicialMesh(dual, [[0, 1, 2]])
+        primal, tangent = torch.autograd.forward_ad.unpack_dual(mesh.barycentric([[0.5, 0.5]]))
+    torch.testing.assert_close(primal, torch.tensor([[[0.5, 0.5, 0.0]]], dtype=torch.float64), rtol=0, atol=0)
+    torch.testing.assert_close(tangent, torch.tensor([[[1.0, 0.0, -1.0]]], dtype=torch.float64), rtol=0, atol=0)
+
+
+def test_exact_forward_mode_cancels_before_rounding_and_retains_reverse_gradients():
+    small, gap = 2.0**-463, 2.0**-500
+    vertices = torch.tensor(
+        [[0.0, 0.0], [2.0**1000, small], [2.0**1000, small + gap]], dtype=torch.float64, requires_grad=True
+    )
+    mesh = SimplicialMesh(vertices, [[0, 1, 2]])
+    point = torch.tensor([[0.0, 0.0]], dtype=torch.float64)
+    # Large opposing terms must cancel before the directional derivative is rounded.
+    direction = torch.tensor([[2.0**1000, small]], dtype=torch.float64)
+    _, tangent = torch.func.jvp(mesh.barycentric, (point,), (direction,))
+    torch.testing.assert_close(tangent, torch.tensor([[[-1.0, 1.0, 0.0]]], dtype=torch.float64), rtol=0, atol=0)
+    (gradient,) = torch.autograd.grad(tangent[0, 0, 2], vertices)
+    slope = 2.0**500
+    expected = torch.tensor([[-small * 2.0**-500, slope], [small * 2.0**-500, -slope], [0.0, 0.0]], dtype=torch.float64)
+    torch.testing.assert_close(gradient, expected, rtol=0, atol=0)
+
+
 def test_exact_inverse_rejects_an_affinely_dependent_simplex():
     """The exact solver must reject a truly singular triangle instead of dividing by a zero pivot."""
     vertices = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float64)

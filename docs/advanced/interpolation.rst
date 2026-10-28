@@ -96,7 +96,10 @@ derivatives. Points are handled independently, including when another point
 has a non-finite upstream gradient. SymPy is declared directly (PyTorch also
 requires it) and is imported lazily for these queries. Symbolic work and
 retained autograd state grow with dimension and derivative order, so this
-path is slower than ordinary tensor differentiation.
+path is slower than ordinary tensor differentiation. Forward-mode queries
+(``torch.autograd.forward_ad`` or ``torch.func.jvp``) with any affected pair
+evaluate the whole query using these expressions, preserving point and vertex
+tangents without exposing dual tensor storage to Python.
 ``locate(batch_size=...)`` bounds temporary float64 storage by
 ``O(batch_size * n_simplices * (d + 1))``, in addition to that cache.
 

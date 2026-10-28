@@ -87,12 +87,18 @@ class _Frexp(torch.autograd.Function):
     def forward(ctx: Any, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         mantissa, exponent = torch.frexp(value)
         ctx.save_for_backward(exponent)
+        ctx.save_for_forward(exponent)
         return mantissa, exponent
 
     @staticmethod
     def backward(ctx: Any, gradient: torch.Tensor, exponent_gradient: None) -> torch.Tensor:
         (exponent,) = ctx.saved_tensors
         return _times_power_of_two(gradient, -exponent)
+
+    @staticmethod
+    def jvp(ctx: Any, tangent: torch.Tensor) -> tuple[torch.Tensor, None]:
+        (exponent,) = ctx.saved_tensors
+        return _times_power_of_two(tangent, -exponent), None
 
 
 def _equilibrate(
@@ -259,7 +265,6 @@ class _ExactExpressions(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx: Any,
         expressions: tuple[Any, ...],
         symbols: tuple[tuple[Any, ...], ...],
         shape: tuple[int, ...],
@@ -278,9 +283,13 @@ class _ExactExpressions(torch.autograd.Function):
                     bindings[symbol] = sp.oo if value > 0 else -sp.oo
         numbers = [expression.xreplace(bindings) for expression in expressions]
         values = [_rounded_fraction(Fraction(int(v.p), int(v.q))) if v.is_Rational else float(v) for v in numbers]
-        ctx.expressions, ctx.symbols = expressions, symbols
-        ctx.save_for_backward(*arguments)
         return torch.tensor(values, dtype=torch.float64).reshape(shape)
+
+    @staticmethod
+    def setup_context(ctx: Any, inputs: tuple[Any, ...], output: torch.Tensor) -> None:
+        ctx.expressions, ctx.symbols, ctx.shape, *arguments = inputs
+        ctx.save_for_backward(*arguments)
+        ctx.save_for_forward(*arguments)
 
     @staticmethod
     def backward(ctx: Any, gradient: torch.Tensor) -> tuple[Any, ...]:
@@ -300,6 +309,29 @@ class _ExactExpressions(torch.autograd.Function):
             )
             result.append(_ExactExpressions.apply(derivatives, symbols, tuple(argument.shape), *arguments, gradient))
         return None, None, None, *result
+
+    @staticmethod
+    def jvp(
+        ctx: Any, expressions_tangent: None, symbols_tangent: None, shape_tangent: None, *tangents: torch.Tensor
+    ) -> torch.Tensor:
+        import sympy as sp
+
+        arguments = ctx.saved_tensors
+        directions = tuple(tuple(sp.Dummy(real=True) for _ in group) for group in ctx.symbols)
+        derivatives = tuple(
+            sp.Add(
+                *(
+                    sp.diff(expression, variable) * direction
+                    for group, tangent_group in zip(ctx.symbols, directions, strict=True)
+                    for variable, direction in zip(group, tangent_group, strict=True)
+                )
+            )
+            for expression in ctx.expressions
+        )
+        result: torch.Tensor = _ExactExpressions.apply(
+            derivatives, (*ctx.symbols, *directions), ctx.shape, *arguments, *tangents
+        )
+        return result
 
 
 def _barycentric_expressions(
@@ -593,6 +625,8 @@ class SimplicialMesh:
         Differentiable affected pairs additionally use cached SymPy expressions. Their derivatives are
         evaluated exactly at every order before rounding, independently for each point. Symbolic work and
         retained autograd state grow with dimension and derivative order; this path is intentionally slower.
+        Forward-mode queries with any affected pair use symbolic expressions for the whole query so that
+        ``forward_ad`` and ``torch.func.jvp`` retain tangents without reading dual tensor storage in Python.
         """
         p = self._check_points(x)
         origin = self.vertices[self.simplices[:, 0]]  # (m, d)
@@ -610,10 +644,36 @@ class SimplicialMesh:
             return coordinates
         return self._exact_barycentric(p, coordinates, uncertain, offset)
 
+    def _forward_barycentric(self, p: torch.Tensor) -> torch.Tensor:
+        """Evaluate dual queries without exposing transformed tensor storage to Python."""
+        # torch.func duals cannot expose storage via tolist/nonzero. Evaluate the full query using
+        # transform-compatible exact expressions, retaining both point and vertex tangents.
+        cells = []
+        for cell in range(self.n_simplices):
+            key = (cell, True)
+            if key not in self._exact_formulas:
+                self._exact_formulas[key] = _barycentric_expressions(self.dimension, [], [], True)
+            expressions, symbols = self._exact_formulas[key]
+            vertices = self.vertices[self.simplices[cell]]
+            cells.append(
+                torch.stack(
+                    [
+                        _ExactExpressions.apply(expressions, symbols, (self.dimension + 1,), point, vertices)
+                        for point in p.unbind()
+                    ]
+                )
+            )
+        return torch.stack(cells, dim=1)
+
     def _exact_barycentric(
         self, p: torch.Tensor, coordinates: torch.Tensor, uncertain: torch.Tensor, offset: torch.Tensor
     ) -> torch.Tensor:
         """Correct cancellation-prone pairs, retaining the derivative of the same affine map."""
+        if (
+            torch.autograd.forward_ad.unpack_dual(p).tangent is not None
+            or torch.autograd.forward_ad.unpack_dual(self.vertices).tangent is not None
+        ):
+            return self._forward_barycentric(p)
         result = coordinates.detach().clone()
         if coordinates.requires_grad:
             # Rebuild the ordinary derivative path with finite offsets: even a zero upstream gradient
