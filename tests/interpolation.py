@@ -454,7 +454,8 @@ def test_exact_fallback_preserves_forward_mode_point_tangents(mode):
             dual = torch.autograd.forward_ad.make_dual(points, direction)
             primal, tangent = torch.autograd.forward_ad.unpack_dual(mesh.barycentric(dual))
     else:
-        primal, tangent = torch.func.jvp(mesh.barycentric, (points,), (direction,))
+        result = torch.func.jvp(mesh.barycentric, (points,), (direction,))
+        primal, tangent = result[0], result[1]
     torch.testing.assert_close(primal, mesh.barycentric(points), rtol=0, atol=0)
     expected = torch.tensor([[[-1.0, 0.0, 1.0]], [[-short, short, 0.0]]], dtype=torch.float64)
     assert tangent is not None
@@ -472,9 +473,8 @@ def test_barycentric_preserves_forward_mode_vertex_tangents(mode, short):
             mesh = SimplicialMesh(dual, [[0, 1, 2]])
             primal, tangent = torch.autograd.forward_ad.unpack_dual(mesh.barycentric([[0.5, 0.5]]))
     else:
-        primal, tangent = torch.func.jvp(
-            lambda v: SimplicialMesh(v, [[0, 1, 2]]).barycentric([[0.5, 0.5]]), (vertices,), (direction,)
-        )
+        result = torch.func.jvp(lambda v: SimplicialMesh(v, [[0, 1, 2]]).barycentric([[0.5, 0.5]]), (vertices,), (direction,))
+        primal, tangent = result[0], result[1]
     torch.testing.assert_close(primal, torch.tensor([[[0.5, 0.5, 0.0]]], dtype=torch.float64), rtol=0, atol=0)
     torch.testing.assert_close(tangent, torch.tensor([[[0.5, 0.0, -0.5]]], dtype=torch.float64), rtol=0, atol=0)
 
@@ -488,7 +488,7 @@ def test_exact_forward_mode_cancels_before_rounding_and_retains_reverse_gradient
     point = torch.tensor([[0.0, 0.0]], dtype=torch.float64)
     # Large opposing terms must cancel before the directional derivative is rounded.
     direction = torch.tensor([[2.0**1000, small]], dtype=torch.float64)
-    _, tangent = torch.func.jvp(mesh.barycentric, (point,), (direction,))
+    tangent = torch.func.jvp(mesh.barycentric, (point,), (direction,))[1]
     torch.testing.assert_close(tangent, torch.tensor([[[-1.0, 1.0, 0.0]]], dtype=torch.float64), rtol=0, atol=0)
     (gradient,) = torch.autograd.grad(tangent[0, 0, 2], vertices)
     slope = 2.0**500
